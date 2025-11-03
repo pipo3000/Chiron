@@ -114,8 +114,14 @@ app/
 
 ## License
 
-[Add your license here]
+This project is licensed under a non-commercial license. All rights reserved.
+
+**Non-Commercial Use Only**: This software and associated documentation files (the "Software") are provided for personal, non-commercial use only. You may not use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software for commercial purposes without express written permission from the author.
+
+**Attribution**: If you use this Software in any non-commercial work, please provide attribution to the original author.
 
 ## Author
 
-[Add author information here]
+**Filipe Barata**
+
+Developer of Chiron - Biological Age Prediction from Accelerometer Data
