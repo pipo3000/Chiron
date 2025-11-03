@@ -1,0 +1,101 @@
+plugins {
+    id "com.android.application"
+    id "org.jetbrains.kotlin.android"
+    id "com.chaquo.python" version "16.1.0"
+}
+
+android {
+    namespace "com.example.chiron"
+    compileSdk 33
+
+    defaultConfig {
+        applicationId "com.example.chiron"
+        minSdk 24
+        targetSdk 33
+        versionCode 1
+        versionName "1.0"
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        vectorDrawables {
+            useSupportLibrary true
+        }
+
+        // ✅ Enable Python with Chaquopy - using Groovy DSL syntax
+        // cosinorage 1.0.5 requires Python 3.9+
+        // Note: Chaquopy will download its own Python 3.9 runtime
+        python {
+            version "3.9"  // Minimum version required by cosinorage
+            // buildPython is not set - Chaquopy will use its bundled Python
+            
+            pip {
+                // Python 3.9 compatible versions
+                // cosinorage requires 'claid' and 'seaborn' as dependencies
+                // Note: 'scikit-digital-health' (skdh) and 'CosinorPy' (needs statsmodels) are not available for Android
+                // We provide minimal stubs in app/src/main/python/skdh/ and CosinorPy/ to allow cosinorage to load
+                install "claid"
+                install "seaborn"
+                install "cosinorage==1.0.5"
+                // Dependencies (numpy, pandas, scipy, matplotlib) are automatically installed
+            }
+        }
+
+        // Native ABI filters (recommended for Chaquopy builds)
+        ndk {
+            abiFilters "arm64-v8a", "armeabi-v7a"
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+    kotlinOptions {
+        jvmTarget = "1.8"
+    }
+    buildFeatures {
+        compose true
+    }
+    composeOptions {
+        kotlinCompilerExtensionVersion "1.4.3"
+    }
+    packaging {
+        resources {
+            excludes += "/META-INF/{AL2.0,LGPL2.1}"
+        }
+    }
+    testOptions {
+        animationsDisabled true
+        unitTests {
+            returnDefaultValues true
+        }
+    }
+}
+
+dependencies {
+    // Chaquopy runtime is automatically included by the plugin
+
+    implementation "androidx.core:core-ktx:1.9.0"
+    implementation "androidx.lifecycle:lifecycle-runtime-ktx:2.6.1"
+    implementation "androidx.activity:activity-compose:1.7.0"
+    implementation platform("androidx.compose:compose-bom:2023.03.00")
+    implementation "androidx.compose.ui:ui"
+    implementation "androidx.compose.ui:ui-graphics"
+    implementation "androidx.compose.ui:ui-tooling-preview"
+    implementation "androidx.compose.material3:material3"
+    testImplementation "junit:junit:4.13.2"
+    androidTestImplementation "androidx.test.ext:junit:1.1.5"
+    androidTestImplementation "androidx.test.espresso:espresso-core:3.5.1"
+    androidTestImplementation "androidx.test:rules:1.5.0"
+    androidTestImplementation "androidx.test:runner:1.5.2"
+    androidTestImplementation platform("androidx.compose:compose-bom:2023.03.00")
+    androidTestImplementation "androidx.compose.ui:ui-test-junit4"
+    debugImplementation "androidx.compose.ui:ui-tooling"
+    debugImplementation "androidx.compose.ui:ui-test-manifest"
+}
+

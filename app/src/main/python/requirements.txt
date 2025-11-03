@@ -1,0 +1,7 @@
+claid
+seaborn
+cosinorage==1.0.5
+# Note: scikit-digital-health (skdh) and CosinorPy (needs statsmodels) are not available for Android via Chaquopy
+# Minimal stubs are provided in app/src/main/python/skdh/ and CosinorPy/ to allow cosinorage to load
+# Dependencies will be resolved automatically by pip
+# Chaquopy provides pre-built wheels for: numpy, pandas, scipy, matplotlib, etc.
