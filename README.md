@@ -39,7 +39,7 @@ timestamp,enmo
 ```
 
 - **timestamp**: ISO 8601 format (YYYY-MM-DDTHH:mm:ss)
-- **enmo**: Euclidean Norm Minus One, calculated as `max(0, sqrt(x² + y² + z²) - 1.0)`
+- **enmo**: Euclidean Norm Minus One, calculated as `max(0, (sqrt(x² + y² + z²) / 9.80665) - 1.0)` where accelerometer values are in m/s² and converted to g units first
 
 ### Python Dependencies
 

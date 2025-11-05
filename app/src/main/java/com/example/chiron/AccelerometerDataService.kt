@@ -128,9 +128,12 @@ class AccelerometerDataService : Service() {
                     val z = it.values[2]
                     val timestamp = System.currentTimeMillis()
                     
-                    // Calculate ENMO: ENMO = max(0, sqrt(x² + y² + z²) - 1.0)
+                    // Calculate ENMO: ENMO = max(0, sqrt(x² + y² + z²) - 1g)
+                    // Android accelerometer returns values in m/s², so convert to g units first
+                    val GRAVITY_MS2 = 9.80665  // Standard gravity in m/s²
                     val magnitude = kotlin.math.sqrt(x * x + y * y + z * z)
-                    val enmo = (magnitude - 1.0).coerceAtLeast(0.0)
+                    val magnitudeG = magnitude / GRAVITY_MS2  // Convert m/s² to g units
+                    val enmo = (magnitudeG - 1.0).coerceAtLeast(0.0)  // ENMO in g units
                     
                     recordAccelerometerData(timestamp, x, y, z, enmo)
                     recordCount++

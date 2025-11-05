@@ -31,7 +31,7 @@ The Python script processes your files and converts them to the format CosinorAg
 - ⚠️ `magnitude` (ignored, but doesn't hurt to include)
 
 **The script automatically:**
-1. Calculates **ENMO** (Euclidean Norm Minus One): `ENMO = max(0, √(x² + y² + z²) - 1)`
+1. Calculates **ENMO** (Euclidean Norm Minus One): `ENMO = max(0, (√(x² + y² + z²) / 9.80665) - 1.0)` where accelerometer values are in m/s² (Android format) and converted to g units first
 2. Converts timestamps from milliseconds to pandas datetime
 3. Resamples data to **minute-level resolution** (1 data point per minute)
 

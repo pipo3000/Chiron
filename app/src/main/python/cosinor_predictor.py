@@ -100,6 +100,25 @@ try:
             raise ImportError("CosinorAge not found in cosinorage.bioages")
     except AttributeError:
         raise ImportError("cosinorage.bioages submodule not found")
+    
+    # Import constants for age computation from cosinorage.bioages.cosinorage
+    try:
+        from cosinorage.bioages.cosinorage import (
+            model_params_male, model_params_female, model_params_generic,
+            m_n, m_d, BA_n, BA_d, BA_i
+        )
+    except ImportError:
+        # These might not be available, will handle gracefully
+        model_params_male = model_params_female = model_params_generic = None
+        m_n = m_d = BA_n = BA_d = BA_i = None
+        print("[DEBUG] Could not import age computation constants from cosinorage.bioages.cosinorage", file=sys.stderr)
+    
+    # Import cosinor_multiday for parameter computation
+    try:
+        from cosinorage.features.utils.cosinor_analysis import cosinor_multiday
+    except ImportError:
+        cosinor_multiday = None
+        print("[DEBUG] Could not import cosinor_multiday from cosinorage.features.utils.cosinor_analysis", file=sys.stderr)
         
 except ImportError as e:
     # Log the actual import error for debugging
@@ -188,8 +207,12 @@ def process_csv_file(csv_file_path, age=40, gender='male'):
         # Convert legacy x,y,z format to enmo if needed
         if has_xyz_format and not has_enmo_format:
             # Calculate ENMO (Euclidean Norm Minus One)
-            df['enmo'] = np.sqrt(df['x']**2 + df['y']**2 + df['z']**2) - 1.0
-            df['enmo'] = df['enmo'].clip(lower=0)  # ENMO cannot be negative
+            # Note: Assumes accelerometer values are in m/s² (Android format)
+            # If values are already in g units, remove the /GRAVITY_MS2 conversion
+            GRAVITY_MS2 = 9.80665  # Standard gravity in m/s²
+            magnitude = np.sqrt(df['x']**2 + df['y']**2 + df['z']**2)
+            magnitude_g = magnitude / GRAVITY_MS2  # Convert m/s² to g units
+            df['enmo'] = (magnitude_g - 1.0).clip(lower=0)  # ENMO in g units
         
         if 'enmo' not in df.columns or 'timestamp' not in df.columns:
             result['message'] = f"Unsupported CSV format. Expected 'timestamp,enmo' or 'timestamp,x,y,z'. Found: {df.columns.tolist()}"
@@ -325,40 +348,79 @@ def process_csv_file(csv_file_path, age=40, gender='male'):
             except Exception as e:
                 print(f"[DEBUG] Could not patch cosinorage internal fit_cosinor: {e}", file=sys.stderr)
             
-            # Compute cosinor parameters manually first (before calling get_predictions)
-            # This ensures we have the parameters available when cosinorage computes the age
+            # Compute cosinor parameters - following reference implementation from predict_age.py
+            # Try cosinor_multiday first (preferred method), fallback to manual computation
             print(f"[DEBUG] Computing cosinor parameters from preprocessed data", file=sys.stderr)
             computed_mesor = None
             computed_amp1 = None
             computed_phi1 = None
             
             try:
-                # Use the preprocessed DataFrame directly (same approach as visualization)
-                # Ensure np is available (imported at module level)
-                enmo_series = preprocessed_df['enmo']
+                # Get minute-level data from the handler
+                ml_data = data_handler.get_ml_data()
                 
-                if len(enmo_series) > 0:
-                    period = 1440.0  # 24 hours in minutes
-                    # Explicitly reference numpy to avoid any scoping issues
-                    import numpy
-                    t = numpy.arange(len(enmo_series))
-                    cos_term = numpy.cos(2 * numpy.pi * t / period)
-                    sin_term = numpy.sin(2 * numpy.pi * t / period)
-                    X = numpy.column_stack([numpy.ones(len(t)), cos_term, sin_term])
+                if ml_data is not None and len(ml_data) > 0:
+                    # Use cosinor_multiday if available (preferred method from reference file)
+                    if cosinor_multiday is not None:
+                        try:
+                            minutes_per_day = 1440
+                            total_minutes = len(ml_data)
+                            full_days = total_minutes // minutes_per_day
+                            
+                            if full_days > 0:
+                                trimmed_minutes = full_days * minutes_per_day
+                                ml_data_trimmed = ml_data.iloc[:trimmed_minutes].copy()
+                                print(f"[DEBUG] Using {trimmed_minutes} minutes ({full_days} full days) for cosinor computation", file=sys.stderr)
+                                
+                                # cosinor_multiday returns a tuple: (params_dict, fitted_data)
+                                cosinor_result, fitted_data = cosinor_multiday(ml_data_trimmed)
+                                
+                                if cosinor_result:
+                                    computed_mesor = float(cosinor_result.get('mesor', 0))
+                                    # Note: key is 'amplitude', not 'amp1' in cosinor_multiday result
+                                    computed_amp1 = float(cosinor_result.get('amplitude', 0))
+                                    computed_phi1 = float(cosinor_result.get('acrophase', 0))
+                                    
+                                    print(f"[DEBUG] Computed via cosinor_multiday: mesor={computed_mesor:.4f}, amp1={computed_amp1:.4f}, phi1={computed_phi1:.4f}", file=sys.stderr)
+                                else:
+                                    print(f"[DEBUG] cosinor_multiday returned empty parameters, falling back to manual computation", file=sys.stderr)
+                                    raise ValueError("cosinor_multiday returned empty result")
+                            else:
+                                print(f"[DEBUG] Need at least 1 full day (1440 minutes), have {total_minutes} minutes", file=sys.stderr)
+                                raise ValueError("Insufficient data for cosinor_multiday")
+                        except Exception as e:
+                            print(f"[DEBUG] cosinor_multiday failed: {e}, falling back to manual computation", file=sys.stderr)
+                            # Fall through to manual computation
                     
-                    # Convert to numpy array
-                    y = numpy.asarray(enmo_series.values)
-                    
-                    coeffs = numpy.linalg.lstsq(X, y, rcond=None)[0]
-                    computed_mesor = float(coeffs[0])
-                    amplitude_cos = float(coeffs[1])
-                    amplitude_sin = float(coeffs[2])
-                    computed_amp1 = float(numpy.sqrt(amplitude_cos**2 + amplitude_sin**2))
-                    computed_phi1 = float(numpy.arctan2(-amplitude_sin, amplitude_cos))
-                    
-                    print(f"[DEBUG] Pre-computed: mesor={computed_mesor:.4f}, amp1={computed_amp1:.4f}, phi1={computed_phi1:.4f}", file=sys.stderr)
+                    # Fallback: manual computation using preprocessed DataFrame
+                    if computed_mesor is None or computed_amp1 is None or computed_phi1 is None:
+                        print(f"[DEBUG] Computing cosinor parameters manually", file=sys.stderr)
+                        enmo_series = preprocessed_df['enmo']
+                        
+                        if len(enmo_series) > 0:
+                            period = 1440.0  # 24 hours in minutes
+                            # Explicitly reference numpy to avoid any scoping issues
+                            import numpy
+                            t = numpy.arange(len(enmo_series))
+                            cos_term = numpy.cos(2 * numpy.pi * t / period)
+                            sin_term = numpy.sin(2 * numpy.pi * t / period)
+                            X = numpy.column_stack([numpy.ones(len(t)), cos_term, sin_term])
+                            
+                            # Convert to numpy array
+                            y = numpy.asarray(enmo_series.values)
+                            
+                            coeffs = numpy.linalg.lstsq(X, y, rcond=None)[0]
+                            computed_mesor = float(coeffs[0])
+                            amplitude_cos = float(coeffs[1])
+                            amplitude_sin = float(coeffs[2])
+                            computed_amp1 = float(numpy.sqrt(amplitude_cos**2 + amplitude_sin**2))
+                            computed_phi1 = float(numpy.arctan2(-amplitude_sin, amplitude_cos))
+                            
+                            print(f"[DEBUG] Pre-computed manually: mesor={computed_mesor:.4f}, amp1={computed_amp1:.4f}, phi1={computed_phi1:.4f}", file=sys.stderr)
+                        else:
+                            print(f"[DEBUG] Preprocessed data is empty", file=sys.stderr)
                 else:
-                    print(f"[DEBUG] Preprocessed data is empty", file=sys.stderr)
+                    print(f"[DEBUG] No minute-level data available from handler", file=sys.stderr)
             except Exception as e:
                 print(f"[DEBUG] Error pre-computing cosinor parameters: {e}", file=sys.stderr)
                 import traceback
@@ -384,69 +446,72 @@ def process_csv_file(csv_file_path, age=40, gender='male'):
                         prediction_result['phi1'] = computed_phi1
                         
                         # Try to recompute cosinorage with the injected parameters
-                        # Use the model_params_male/female/generic to compute age manually
+                        # Use the reference implementation formula from predict_age.py
                         try:
                             # Get the appropriate model parameters based on gender
-                            if gender == 'male' and hasattr(cosinor_age_model, 'model_params_male'):
-                                model_params = cosinor_age_model.model_params_male
-                                print(f"[DEBUG] Using model_params_male: {model_params}", file=sys.stderr)
-                            elif gender == 'female' and hasattr(cosinor_age_model, 'model_params_female'):
-                                model_params = cosinor_age_model.model_params_female
-                                print(f"[DEBUG] Using model_params_female: {model_params}", file=sys.stderr)
-                            elif hasattr(cosinor_age_model, 'model_params_generic'):
-                                model_params = cosinor_age_model.model_params_generic
-                                print(f"[DEBUG] Using model_params_generic: {model_params}", file=sys.stderr)
+                            coef = None
+                            if gender == 'male':
+                                if model_params_male is not None:
+                                    coef = model_params_male
+                                    print(f"[DEBUG] Using model_params_male", file=sys.stderr)
+                                elif hasattr(cosinor_age_model, 'model_params_male'):
+                                    coef = cosinor_age_model.model_params_male
+                                    print(f"[DEBUG] Using model_params_male from model", file=sys.stderr)
+                            elif gender == 'female':
+                                if model_params_female is not None:
+                                    coef = model_params_female
+                                    print(f"[DEBUG] Using model_params_female", file=sys.stderr)
+                                elif hasattr(cosinor_age_model, 'model_params_female'):
+                                    coef = cosinor_age_model.model_params_female
+                                    print(f"[DEBUG] Using model_params_female from model", file=sys.stderr)
                             else:
-                                model_params = None
-                                print(f"[DEBUG] No model parameters found for gender={gender}", file=sys.stderr)
+                                if model_params_generic is not None:
+                                    coef = model_params_generic
+                                    print(f"[DEBUG] Using model_params_generic", file=sys.stderr)
+                                elif hasattr(cosinor_age_model, 'model_params_generic'):
+                                    coef = cosinor_age_model.model_params_generic
+                                    print(f"[DEBUG] Using model_params_generic from model", file=sys.stderr)
                             
-                            if model_params is not None:
-                                # Model parameters format: dict with keys: 'rate' (intercept), 'mesor', 'amp1', 'phi1', 'age', 'shape'
-                                # Formula: cosinorage = rate + mesor_coef*mesor + amp1_coef*amp1 + phi1_coef*phi1 + age_coef*age
+                            if coef is not None and m_n is not None and m_d is not None and BA_n is not None and BA_d is not None and BA_i is not None:
+                                # Use the reference implementation formula from predict_age.py (lines 257-266)
                                 try:
-                                    # Try different parameter formats
-                                    if isinstance(model_params, dict):
-                                        # Dictionary format: {'rate': intercept, 'mesor': coef, 'amp1': coef, 'phi1': coef, 'age': coef, 'shape': ...}
-                                        rate = float(model_params.get('rate', 0.0))
-                                        mesor_coef = float(model_params.get('mesor', 0.0))
-                                        amp1_coef = float(model_params.get('amp1', 0.0))
-                                        phi1_coef = float(model_params.get('phi1', 0.0))
-                                        age_coef = float(model_params.get('age', 0.0))
-                                        
-                                        # Compute biological age using linear regression formula
-                                        computed_age = rate + mesor_coef*computed_mesor + amp1_coef*computed_amp1 + phi1_coef*computed_phi1 + age_coef*age
-                                        prediction_result['cosinorage'] = float(computed_age)
-                                        print(f"[DEBUG] Computed cosinorage manually: {computed_age:.2f} (rate={rate:.4f}, mesor_coef={mesor_coef:.4f}, amp1_coef={amp1_coef:.4f}, phi1_coef={phi1_coef:.4f}, age_coef={age_coef:.4f})", file=sys.stderr)
-                                    elif isinstance(model_params, (list, tuple, np.ndarray)):
-                                        params = np.asarray(model_params)
-                                        print(f"[DEBUG] Model parameters shape: {params.shape}, values: {params}", file=sys.stderr)
-                                        
-                                        # Array format: [intercept, mesor, amp1, phi1, age, ...]
-                                        if len(params) >= 5:
-                                            intercept = float(params[0])
-                                            mesor_coef = float(params[1]) if len(params) > 1 else 0.0
-                                            amp1_coef = float(params[2]) if len(params) > 2 else 0.0
-                                            phi1_coef = float(params[3]) if len(params) > 3 else 0.0
-                                            age_coef = float(params[4]) if len(params) > 4 else 0.0
-                                            
-                                            # Compute biological age
-                                            computed_age = intercept + mesor_coef*computed_mesor + amp1_coef*computed_amp1 + phi1_coef*computed_phi1 + age_coef*age
-                                            prediction_result['cosinorage'] = float(computed_age)
-                                            print(f"[DEBUG] Computed cosinorage manually: {computed_age:.2f} (intercept={intercept:.4f}, mesor_coef={mesor_coef:.4f}, amp1_coef={amp1_coef:.4f}, phi1_coef={phi1_coef:.4f}, age_coef={age_coef:.4f})", file=sys.stderr)
-                                        else:
-                                            print(f"[DEBUG] Model parameters array too short: {len(params)}", file=sys.stderr)
-                                    elif hasattr(model_params, 'predict'):
-                                        # If it's a model object, use predict
-                                        features = np.array([[computed_mesor, computed_amp1, computed_phi1, age]])
-                                        predicted = model_params.predict(features)
-                                        prediction_result['cosinorage'] = float(predicted[0])
-                                        print(f"[DEBUG] Used model_params.predict: cosinorage={predicted[0]}", file=sys.stderr)
-                                    else:
-                                        print(f"[DEBUG] Model parameters format not recognized: {type(model_params)}", file=sys.stderr)
+                                    # Prepare biomarker data
+                                    bm_data = {
+                                        'mesor': computed_mesor,
+                                        'amp1': computed_amp1,
+                                        'phi1': computed_phi1,
+                                        'age': age
+                                    }
+                                    
+                                    # Compute xb = sum(bm_data[key] * coef[key]) + coef["rate"]
+                                    n1 = {key: bm_data[key] * coef[key] for key in bm_data}
+                                    xb = sum(n1.values()) + coef['rate']
+                                    
+                                    # Compute m_val = 1 - exp((m_n * exp(xb)) / m_d)
+                                    m_val = 1 - np.exp((m_n * np.exp(xb)) / m_d)
+                                    
+                                    # Compute cosinorage = ((log(BA_n * log(1 - m_val))) / BA_d) + BA_i
+                                    # Note: This computes the biological age directly, not the advance
+                                    predicted_age = float(((np.log(BA_n * np.log(1 - m_val))) / BA_d) + BA_i)
+                                    age_advance = float(predicted_age - age)
+                                    
+                                    prediction_result['cosinorage'] = predicted_age
+                                    prediction_result['cosinorage_advance'] = age_advance
+                                    
+                                    print(f"[DEBUG] Computed cosinorage using reference formula: predicted_age={predicted_age:.2f}, age_advance={age_advance:.2f}", file=sys.stderr)
+                                    print(f"[DEBUG] Formula: xb={xb:.4f}, m_val={m_val:.4f}, predicted_age={predicted_age:.2f}", file=sys.stderr)
                                 except Exception as e:
-                                    print(f"[DEBUG] Error computing cosinorage from model_params: {e}", file=sys.stderr)
+                                    print(f"[DEBUG] Error computing cosinorage using reference formula: {e}", file=sys.stderr)
                                     import traceback
                                     print(f"[DEBUG] Traceback: {traceback.format_exc()}", file=sys.stderr)
+                            else:
+                                print(f"[DEBUG] Missing required constants for age computation", file=sys.stderr)
+                                if coef is None:
+                                    print(f"[DEBUG]   - coef is None", file=sys.stderr)
+                                if m_n is None or m_d is None:
+                                    print(f"[DEBUG]   - m_n={m_n}, m_d={m_d}", file=sys.stderr)
+                                if BA_n is None or BA_d is None or BA_i is None:
+                                    print(f"[DEBUG]   - BA_n={BA_n}, BA_d={BA_d}, BA_i={BA_i}", file=sys.stderr)
                         except Exception as e:
                             print(f"[DEBUG] Could not recompute cosinorage: {e}", file=sys.stderr)
                             import traceback
@@ -463,25 +528,24 @@ def process_csv_file(csv_file_path, age=40, gender='male'):
                         print(f"[DEBUG] {key} = {value}", file=sys.stderr)
                 
                 predicted_age = prediction_result.get('cosinorage')
+                age_advance = prediction_result.get('cosinorage_advance')
                 mesor = prediction_result.get('mesor')
                 amp1 = prediction_result.get('amp1')
                 phi1 = prediction_result.get('phi1')
                 
-                print(f"[DEBUG] Extracted values: cosinorage={predicted_age}, mesor={mesor}, amp1={amp1}, phi1={phi1}", file=sys.stderr)
+                print(f"[DEBUG] Extracted values: cosinorage={predicted_age}, cosinorage_advance={age_advance}, mesor={mesor}, amp1={amp1}, phi1={phi1}", file=sys.stderr)
                 
                 if predicted_age is not None:
-                    # cosinorage represents the age difference/advance
-                    # Biological age = chronological age + cosinorage
-                    # If cosinorage is negative, biological age is younger than chronological
-                    biological_age = age + float(predicted_age)
-                    result['success'] = True
-                    result['cosinor_age'] = float(biological_age)
-                    result['cosinorage_advance'] = float(predicted_age)  # Store the advance separately
-                    result['message'] = f"CosinorAge prediction successful: {biological_age:.2f} years (advance: {predicted_age:.2f} years)"
+                    # According to reference implementation, cosinorage is the predicted biological age
+                    # If cosinorage_advance is not available, compute it
+                    if age_advance is None:
+                        age_advance = float(predicted_age) - age
                     
-                    # Also include advance if available
-                    if 'cosinorage_advance' in prediction_result:
-                        result['cosinorage_advance'] = prediction_result['cosinorage_advance']
+                    biological_age = float(predicted_age)
+                    result['success'] = True
+                    result['cosinor_age'] = biological_age
+                    result['cosinorage_advance'] = float(age_advance)
+                    result['message'] = f"CosinorAge prediction successful: {biological_age:.2f} years (advance: {age_advance:+.2f} years)"
                 else:
                     # Provide more detailed error message
                     error_msg = f"Prediction failed. cosinorage=None"
@@ -548,6 +612,7 @@ def predict_from_file(csv_file_path, age=None, gender=None):
 def get_visualization_data(csv_file_path, age=None, gender=None):
     """
     Get ENMO data and cosinor fit for visualization.
+    Uses cosinor_multiday if available, following the reference implementation.
     
     Args:
         csv_file_path: Path to CSV file
@@ -576,10 +641,22 @@ def get_visualization_data(csv_file_path, age=None, gender=None):
     if gender is None:
         gender = 'male'
     
+    temp_file_path = None
+    
     try:
         if not Path(csv_file_path).exists():
             result['message'] = f"File not found: {csv_file_path}"
             return json.dumps(result)
+        
+        if GenericDataHandler is None:
+            result['message'] = "GenericDataHandler not available"
+            return json.dumps(result)
+        
+        # Create a temporary file for GenericDataHandler
+        import tempfile
+        temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False)
+        temp_file_path = temp_file.name
+        temp_file.close()
         
         # Read and preprocess CSV
         df = pd.read_csv(csv_file_path)
@@ -588,8 +665,13 @@ def get_visualization_data(csv_file_path, age=None, gender=None):
         has_xyz_format = all(col in df.columns for col in ['x', 'y', 'z'])
         
         if has_xyz_format and not has_enmo_format:
-            df['enmo'] = np.sqrt(df['x']**2 + df['y']**2 + df['z']**2) - 1.0
-            df['enmo'] = df['enmo'].clip(lower=0)
+            # Calculate ENMO (Euclidean Norm Minus One)
+            # Note: Assumes accelerometer values are in m/s² (Android format)
+            # If values are already in g units, remove the /GRAVITY_MS2 conversion
+            GRAVITY_MS2 = 9.80665  # Standard gravity in m/s²
+            magnitude = np.sqrt(df['x']**2 + df['y']**2 + df['z']**2)
+            magnitude_g = magnitude / GRAVITY_MS2  # Convert m/s² to g units
+            df['enmo'] = (magnitude_g - 1.0).clip(lower=0)  # ENMO in g units
         
         if 'enmo' not in df.columns or 'timestamp' not in df.columns:
             result['message'] = f"Unsupported CSV format. Expected 'timestamp,enmo' or 'timestamp,x,y,z'"
@@ -604,62 +686,151 @@ def get_visualization_data(csv_file_path, age=None, gender=None):
             result['message'] = "No valid data found in CSV file"
             return json.dumps(result)
         
-        # Use the preprocessed DataFrame directly
-        enmo_series = df['enmo']
-        timestamps = df['timestamp']
+        # Save to temporary file for GenericDataHandler
+        df.to_csv(temp_file_path, index=False)
         
-        # Convert timestamps to strings for JSON serialization
-        timestamp_strs = [str(ts) for ts in timestamps]
-        
-        result['timestamps'] = timestamp_strs
-        result['enmo_values'] = enmo_series.tolist()
-        
-        # Compute cosinor fit manually using the data
+        # Use GenericDataHandler to preprocess data (same as prediction)
         try:
-            if len(enmo_series) > 0:
-                # Compute cosinor fit: mesor + amplitude * cos(2*pi*t/period + acrophase)
-                # For circadian rhythm, period is 24 hours (1440 minutes)
-                period = 1440.0  # 24 hours in minutes
-                t = np.arange(len(enmo_series))
+            data_handler = GenericDataHandler(
+                file_path=temp_file_path,
+                data_format='csv',
+                data_type='enmo-mg',
+                time_format='datetime',
+                time_column='timestamp',
+                data_columns=['enmo'],
+                verbose=False
+            )
+            
+            # Get minute-level data for cosinor_multiday
+            ml_data = data_handler.get_ml_data()
+            
+            if ml_data is None or len(ml_data) == 0:
+                result['message'] = "No minute-level data available after preprocessing"
+                return json.dumps(result)
+            
+            # Extract timestamps and ENMO values from minute-level data
+            # ml_data is a DataFrame with DatetimeIndex and ENMO column
+            timestamps = ml_data.index
+            enmo_series = ml_data.iloc[:, 0] if len(ml_data.columns) > 0 else ml_data.squeeze()
+            
+            # Convert timestamps to strings for JSON serialization
+            timestamp_strs = [str(ts) for ts in timestamps]
+            
+            result['timestamps'] = timestamp_strs
+            result['enmo_values'] = enmo_series.tolist()
+            
+            # Compute cosinor fit using cosinor_multiday (preferred) or manual computation
+            mesor = None
+            amplitude = None
+            acrophase = None
+            cosinor_fit = None
+            
+            try:
+                # Try to use cosinor_multiday if available
+                if cosinor_multiday is not None and ml_data is not None and len(ml_data) > 0:
+                    try:
+                        minutes_per_day = 1440
+                        total_minutes = len(ml_data)
+                        full_days = total_minutes // minutes_per_day
+                        
+                        if full_days > 0:
+                            trimmed_minutes = full_days * minutes_per_day
+                            ml_data_trimmed = ml_data.iloc[:trimmed_minutes].copy()
+                            
+                            # cosinor_multiday returns a tuple: (params_dict, fitted_data)
+                            cosinor_result, fitted_data = cosinor_multiday(ml_data_trimmed)
+                            
+                            if cosinor_result and fitted_data is not None:
+                                mesor = float(cosinor_result.get('mesor', 0))
+                                amplitude = float(cosinor_result.get('amplitude', 0))
+                                acrophase = float(cosinor_result.get('acrophase', 0))
+                                
+                                # Use the fitted_data from cosinor_multiday
+                                # Map it back to the preprocessed data length if needed
+                                if hasattr(fitted_data, 'values'):
+                                    fit_values = fitted_data.values
+                                elif hasattr(fitted_data, 'tolist'):
+                                    fit_values = fitted_data.tolist()
+                                else:
+                                    fit_values = list(fitted_data)
+                                
+                                # If fitted_data length matches, use it directly
+                                # Otherwise, compute fit using the parameters
+                                if len(fit_values) == len(enmo_series):
+                                    cosinor_fit = fit_values
+                                else:
+                                    # Compute fit using the parameters for the full length
+                                    period = 1440.0
+                                    t = np.arange(len(enmo_series))
+                                    cosinor_fit = mesor + amplitude * np.cos(2 * np.pi * t / period + acrophase)
+                                    cosinor_fit = cosinor_fit.tolist()
+                                
+                                print(f"[DEBUG] Visualization: Used cosinor_multiday, mesor={mesor:.4f}, amplitude={amplitude:.4f}, acrophase={acrophase:.4f}", file=sys.stderr)
+                    except Exception as e:
+                        print(f"[DEBUG] cosinor_multiday failed for visualization: {e}, falling back to manual computation", file=sys.stderr)
+                        # Fall through to manual computation
                 
-                # Simple cosinor fit using least squares
-                # y = M + A*cos(2*pi*t/T + phi)
-                # We'll use a simpler approach: fit to cos(2*pi*t/T) and sin(2*pi*t/T)
-                cos_term = np.cos(2 * np.pi * t / period)
-                sin_term = np.sin(2 * np.pi * t / period)
+                # Fallback: manual computation
+                if cosinor_fit is None or mesor is None or amplitude is None or acrophase is None:
+                    print(f"[DEBUG] Computing cosinor fit manually for visualization", file=sys.stderr)
+                    if len(enmo_series) > 0:
+                        period = 1440.0  # 24 hours in minutes
+                        t = np.arange(len(enmo_series))
+                        
+                        # Linear regression: y = M + A_cos*cos + A_sin*sin
+                        cos_term = np.cos(2 * np.pi * t / period)
+                        sin_term = np.sin(2 * np.pi * t / period)
+                        X = np.column_stack([np.ones(len(t)), cos_term, sin_term])
+                        coeffs = np.linalg.lstsq(X, enmo_series.values, rcond=None)[0]
+                        
+                        mesor = float(coeffs[0])
+                        amplitude_cos = float(coeffs[1])
+                        amplitude_sin = float(coeffs[2])
+                        amplitude = float(np.sqrt(amplitude_cos**2 + amplitude_sin**2))
+                        acrophase = float(np.arctan2(-amplitude_sin, amplitude_cos))
+                        
+                        # Compute fit values
+                        cosinor_fit = mesor + amplitude * np.cos(2 * np.pi * t / period + acrophase)
+                        cosinor_fit = cosinor_fit.tolist()
                 
-                # Linear regression: y = M + A_cos*cos + A_sin*sin
-                X = np.column_stack([np.ones(len(t)), cos_term, sin_term])
-                coeffs = np.linalg.lstsq(X, enmo_series.values, rcond=None)[0]
+                if cosinor_fit is not None and mesor is not None and amplitude is not None and acrophase is not None:
+                    result['cosinor_fit'] = cosinor_fit
+                    result['cosinor_params'] = {
+                        'mesor': mesor,
+                        'amplitude': amplitude,
+                        'acrophase': acrophase
+                    }
+                    result['success'] = True
+                    result['message'] = "Visualization data computed successfully"
+                else:
+                    result['message'] = "ENMO data available, but cosinor fit computation failed"
+                    result['success'] = True  # Still return ENMO data
+                    
+            except Exception as e:
+                # If cosinor fit fails, just return ENMO data
+                result['message'] = f"ENMO data available, but cosinor fit failed: {str(e)}"
+                result['success'] = True  # Still return ENMO data
+                print(f"[DEBUG] Visualization cosinor fit error: {e}", file=sys.stderr)
+                import traceback
+                print(f"[DEBUG] Traceback: {traceback.format_exc()}", file=sys.stderr)
                 
-                mesor = float(coeffs[0])
-                amplitude_cos = float(coeffs[1])
-                amplitude_sin = float(coeffs[2])
-                amplitude = float(np.sqrt(amplitude_cos**2 + amplitude_sin**2))
-                acrophase = float(np.arctan2(-amplitude_sin, amplitude_cos))
-                
-                # Compute fit values
-                cosinor_fit = mesor + amplitude * np.cos(2 * np.pi * t / period + acrophase)
-                
-                result['cosinor_fit'] = cosinor_fit.tolist()
-                result['cosinor_params'] = {
-                    'mesor': mesor,
-                    'amplitude': amplitude,
-                    'acrophase': acrophase
-                }
-                
-                result['success'] = True
-                result['message'] = "Visualization data computed successfully"
         except Exception as e:
-            # If cosinor fit fails, just return ENMO data
-            result['message'] = f"ENMO data available, but cosinor fit failed: {str(e)}"
-            result['success'] = True  # Still return ENMO data
+            result['message'] = f"Error processing data with GenericDataHandler: {str(e)}"
+            import traceback
+            result['traceback'] = traceback.format_exc()
         
     except Exception as e:
         result['error'] = str(e)
         result['message'] = f"Error getting visualization data: {str(e)}"
         import traceback
         result['traceback'] = traceback.format_exc()
+    finally:
+        # Clean up temporary file
+        if temp_file_path and Path(temp_file_path).exists():
+            try:
+                Path(temp_file_path).unlink()
+            except:
+                pass
     
     return json.dumps(result)
 
