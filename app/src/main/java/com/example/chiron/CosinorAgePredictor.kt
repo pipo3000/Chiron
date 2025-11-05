@@ -468,11 +468,13 @@ object CosinorAgePredictor {
      * Collects all previous day files (excluding today) from all Chiron directories.
      */
     fun getAllPreviousDayFiles(context: Context, maxDays: Int = 14): List<File> {
-        val dirs = getAllChironDirs(context)
-        if (dirs.isEmpty()) {
-            android.util.Log.w("CosinorAgePredictor", "getAllPreviousDayFiles: No Chiron directories found")
+        // Only use Downloads/Chiron folder, not app storage
+        val chironDir = getChironDir()
+        if (chironDir == null || !chironDir.exists() || !chironDir.isDirectory) {
+            android.util.Log.w("CosinorAgePredictor", "getAllPreviousDayFiles: Downloads/Chiron directory not found")
             return emptyList()
         }
+        val dirs = listOf(chironDir)
         
         // Get today's date and calculate cutoff date (maxDays ago)
         val calendar = java.util.Calendar.getInstance()
@@ -521,8 +523,17 @@ object CosinorAgePredictor {
             }
         }
         
+        // Deduplicate files by name (in case same file exists in multiple directories)
+        val uniqueFiles = allPreviousFiles
+            .groupBy { it.name }
+            .map { (_, files) -> files.first() }  // Take the first occurrence of each filename
+        
         // Sort by filename (which contains date) to ensure chronological order
-        return allPreviousFiles.sortedBy { it.name }
+        val sortedFiles = uniqueFiles.sortedBy { it.name }
+        
+        android.util.Log.d("CosinorAgePredictor", "Found ${allPreviousFiles.size} files, ${sortedFiles.size} unique: ${sortedFiles.map { it.name }}")
+        
+        return sortedFiles
     }
     
     /**
@@ -587,9 +598,9 @@ object CosinorAgePredictor {
      * Useful for predictions where we want complete data from previous days.
      */
     fun predictCosinorAgeFromPreviousDays(context: Context, age: Int? = null, gender: String? = null): CosinorAgeResult {
-        android.util.Log.d("CosinorAgePredictor", "predictCosinorAgeFromPreviousDays: Starting search for previous day files")
+        android.util.Log.d("CosinorAgePredictor", "predictCosinorAgeFromPreviousDays: Starting search for previous day files (last 14 days)")
         
-        val files = getAllPreviousDayFiles(context)
+        val files = getAllPreviousDayFiles(context, maxDays = 14)
         if (files.isEmpty()) {
             // Try to get all directories and list files for better error message
             val dirs = getAllChironDirs(context)
@@ -656,4 +667,126 @@ object CosinorAgePredictor {
         
         return result
     }
+    
+    /**
+     * Gets visualization data (ENMO and cosinor fit) for plotting.
+     */
+    fun getVisualizationData(
+        context: Context,
+        file: File,
+        age: Int? = null,
+        gender: String? = null
+    ): VisualizationDataResult {
+        if (!file.exists() || file.length() < 100) {
+            return VisualizationDataResult(
+                success = false,
+                message = "File missing or insufficient data"
+            )
+        }
+
+        if (!initializePython(context)) {
+            return VisualizationDataResult(
+                success = false,
+                message = "Failed to initialize Python runtime"
+            )
+        }
+
+        return try {
+            val pythonClass = Class.forName("com.chaquo.python.Python")
+            val getInstanceMethod = pythonClass.getMethod("getInstance")
+            val python = getInstanceMethod.invoke(null)
+
+            val getModuleMethod = python.javaClass.getMethod("getModule", String::class.java)
+            val module = getModuleMethod.invoke(python, "cosinor_predictor")
+
+            val methods = module.javaClass.methods
+            val callAttrMethod = methods.find {
+                it.name == "callAttr" &&
+                    it.parameterTypes.size >= 1 &&
+                    it.parameterTypes[0] == String::class.java
+            } ?: throw NoSuchMethodException("callAttr method not found")
+
+            val resultObj = if (callAttrMethod.isVarArgs) {
+                callAttrMethod.invoke(
+                    module,
+                    "get_visualization_data",
+                    arrayOf<Any>(
+                        file.absolutePath,
+                        age ?: 40,
+                        gender ?: "male"
+                    )
+                )
+            } else {
+                callAttrMethod.invoke(
+                    module,
+                    "get_visualization_data",
+                    file.absolutePath,
+                    age ?: 40,
+                    gender ?: "male"
+                )
+            }
+            val resultJson = resultObj.toString()
+
+            val json = JSONObject(resultJson)
+            val success = json.getBoolean("success")
+            val message = json.getString("message")
+            
+            val timestamps = mutableListOf<String>()
+            val enmoValues = mutableListOf<Double>()
+            val cosinorFit = mutableListOf<Double>()
+            
+            if (json.has("timestamps")) {
+                val timestampsArray = json.getJSONArray("timestamps")
+                for (i in 0 until timestampsArray.length()) {
+                    timestamps.add(timestampsArray.getString(i))
+                }
+            }
+            
+            if (json.has("enmo_values")) {
+                val enmoArray = json.getJSONArray("enmo_values")
+                for (i in 0 until enmoArray.length()) {
+                    enmoValues.add(enmoArray.getDouble(i))
+                }
+            }
+            
+            if (json.has("cosinor_fit")) {
+                val fitArray = json.getJSONArray("cosinor_fit")
+                for (i in 0 until fitArray.length()) {
+                    cosinorFit.add(fitArray.getDouble(i))
+                }
+            }
+            
+            val cosinorParams = mutableMapOf<String, Double>()
+            if (json.has("cosinor_params")) {
+                val paramsObj = json.getJSONObject("cosinor_params")
+                if (paramsObj.has("mesor")) cosinorParams["mesor"] = paramsObj.getDouble("mesor")
+                if (paramsObj.has("amplitude")) cosinorParams["amplitude"] = paramsObj.getDouble("amplitude")
+                if (paramsObj.has("acrophase")) cosinorParams["acrophase"] = paramsObj.getDouble("acrophase")
+            }
+
+            VisualizationDataResult(
+                success = success,
+                message = message,
+                timestamps = timestamps,
+                enmoValues = enmoValues,
+                cosinorFit = cosinorFit,
+                cosinorParams = cosinorParams
+            )
+        } catch (e: Exception) {
+            android.util.Log.e("CosinorAgePredictor", "Error getting visualization data: ${e.message}", e)
+            VisualizationDataResult(
+                success = false,
+                message = "Error: ${e.message}"
+            )
+        }
+    }
 }
+
+data class VisualizationDataResult(
+    val success: Boolean,
+    val message: String,
+    val timestamps: List<String> = emptyList(),
+    val enmoValues: List<Double> = emptyList(),
+    val cosinorFit: List<Double> = emptyList(),
+    val cosinorParams: Map<String, Double> = emptyMap()
+)

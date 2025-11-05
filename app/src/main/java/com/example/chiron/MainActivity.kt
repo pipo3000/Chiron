@@ -22,10 +22,16 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.wrapContentSize
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -42,10 +48,12 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.lifecycle.lifecycleScope
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.tooling.preview.Preview
@@ -122,7 +130,7 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    SkullWithPrediction(
+                    MainScreen(
                         isRecording = isRecordingState.value,
                         onUpdateRecordingState = { updateServiceState() }
                     )
@@ -245,18 +253,7 @@ fun SkullWithPrediction(
             try {
                 isLoadingAge = true
                 // Use previous days' files (not today) for prediction
-                var result = CosinorAgePredictor.predictCosinorAgeFromPreviousDays(context, age = 39, gender = "male")
-                
-                // If no previous files, try using test data
-                if (!result.success) {
-                    val testFile = CosinorAgePredictor.copyTestFileFromAssets(context, "accelerometer_20251030.csv")
-                    if (testFile != null && testFile.exists()) {
-                        result = CosinorAgePredictor.predictCosinorAgeFromFile(context, testFile, age = 39, gender = "male")
-                        if (result.success) {
-                            ageMessage = "Using test data"
-                        }
-                    }
-                }
+                val result = CosinorAgePredictor.predictCosinorAgeFromPreviousDays(context, age = 39, gender = "male")
 
                 withContext(Dispatchers.Main) {
                     if (result.success && result.cosinorAge != null) {
@@ -442,6 +439,307 @@ fun ImageView(modifier: Modifier = Modifier) {
                 .aspectRatio(1f), // Change to aspectRatio(16f / 9f) for landscape, or remove for auto
             contentScale = ContentScale.Fit // Use ContentScale.Crop for fill, ContentScale.Fit for fit
         )
+    }
+}
+
+@Composable
+fun MainScreen(
+    isRecording: Boolean = false,
+    onUpdateRecordingState: () -> Unit = {}
+) {
+    var selectedTabIndex by remember { mutableStateOf(0) }
+    val tabs = listOf("Prediction", "Visualization")
+    
+    Column(modifier = Modifier.fillMaxSize()) {
+        TabRow(selectedTabIndex = selectedTabIndex) {
+            tabs.forEachIndexed { index, title ->
+                Tab(
+                    selected = selectedTabIndex == index,
+                    onClick = { selectedTabIndex = index },
+                    text = { Text(title) }
+                )
+            }
+        }
+        
+        when (selectedTabIndex) {
+            0 -> SkullWithPrediction(
+                isRecording = isRecording,
+                onUpdateRecordingState = onUpdateRecordingState
+            )
+            1 -> DataVisualizationScreen()
+        }
+    }
+}
+
+@Composable
+fun DataVisualizationScreen() {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
+    
+    var isLoading by remember { mutableStateOf(false) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+    var enmoValues by remember { mutableStateOf<List<Double>>(emptyList()) }
+    var cosinorFit by remember { mutableStateOf<List<Double>>(emptyList()) }
+    var cosinorParams by remember { mutableStateOf<Map<String, Double>>(emptyMap()) }
+    
+    // Load visualization data
+    LaunchedEffect(Unit) {
+        coroutineScope.launch(Dispatchers.IO) {
+            try {
+                isLoading = true
+                errorMessage = null
+                
+                // Get previous day files (last 14 days)
+                val files = CosinorAgePredictor.getAllPreviousDayFiles(context, maxDays = 14)
+                if (files.isEmpty()) {
+                    errorMessage = "No data files available for visualization"
+                    isLoading = false
+                    return@launch
+                }
+                
+                // Concatenate files
+                val tempDir = context.cacheDir
+                val concatenatedFile = java.io.File(tempDir, "viz_${System.currentTimeMillis()}.csv")
+                
+                if (!CosinorAgePredictor.concatenateCsvFiles(files, concatenatedFile)) {
+                    errorMessage = "Failed to prepare data for visualization"
+                    isLoading = false
+                    return@launch
+                }
+                
+                // Get visualization data
+                val result = CosinorAgePredictor.getVisualizationData(
+                    context,
+                    concatenatedFile,
+                    age = 39,
+                    gender = "male"
+                )
+                
+                // Clean up temp file
+                try {
+                    if (concatenatedFile.exists()) {
+                        concatenatedFile.delete()
+                    }
+                } catch (e: Exception) {
+                    // Ignore cleanup errors
+                }
+                
+                withContext(Dispatchers.Main) {
+                    if (result.success) {
+                        enmoValues = result.enmoValues
+                        cosinorFit = result.cosinorFit
+                        cosinorParams = result.cosinorParams
+                    } else {
+                        errorMessage = result.message
+                    }
+                    isLoading = false
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    errorMessage = "Error: ${e.message}"
+                    isLoading = false
+                }
+            }
+        }
+    }
+    
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(
+            text = "ENMO & Cosinor Fit Visualization",
+            style = MaterialTheme.typography.headlineMedium,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.padding(bottom = 16.dp)
+        )
+        
+        if (isLoading) {
+            Text(
+                text = "Loading data...",
+                modifier = Modifier.padding(32.dp)
+            )
+        } else if (errorMessage != null) {
+            Text(
+                text = errorMessage!!,
+                color = MaterialTheme.colorScheme.error,
+                modifier = Modifier.padding(16.dp)
+            )
+        } else if (enmoValues.isEmpty()) {
+            Text(
+                text = "No data available",
+                modifier = Modifier.padding(32.dp)
+            )
+        } else {
+            // Display cosinor parameters
+            if (cosinorParams.isNotEmpty()) {
+                Column(
+                    modifier = Modifier.padding(bottom = 16.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    cosinorParams["mesor"]?.let {
+                        Text("Mesor: ${String.format("%.4f", it)}", modifier = Modifier.padding(4.dp))
+                    }
+                    cosinorParams["amplitude"]?.let {
+                        Text("Amplitude: ${String.format("%.4f", it)}", modifier = Modifier.padding(4.dp))
+                    }
+                    cosinorParams["acrophase"]?.let {
+                        Text("Acrophase: ${String.format("%.4f", it)}", modifier = Modifier.padding(4.dp))
+                    }
+                }
+            }
+            
+            // Chart visualization
+            ENMOChart(
+                enmoValues = enmoValues,
+                cosinorFit = cosinorFit,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+            )
+        }
+    }
+}
+
+@Composable
+fun ENMOChart(
+    enmoValues: List<Double>,
+    cosinorFit: List<Double>,
+    modifier: Modifier = Modifier
+) {
+    Column(modifier = modifier) {
+        // Chart area
+        Box(modifier = Modifier.weight(1f)) {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+            if (enmoValues.isEmpty()) return@Canvas
+            
+            val padding = 50.dp.toPx()  // Increased padding for axis labels
+            val chartWidth = size.width - 2 * padding
+            val chartHeight = size.height - 2 * padding
+            
+            // Find min/max for scaling
+            val allValues = (enmoValues + cosinorFit).filter { it.isFinite() }
+            val minY = allValues.minOrNull() ?: 0.0
+            val maxY = allValues.maxOrNull() ?: 1.0
+            val yRange = (maxY - minY).coerceAtLeast(0.001)
+            
+            // Draw axes
+            drawLine(
+                color = androidx.compose.ui.graphics.Color.Gray,
+                start = androidx.compose.ui.geometry.Offset(padding, padding),
+                end = androidx.compose.ui.geometry.Offset(padding, size.height - padding),
+                strokeWidth = 2.dp.toPx()
+            )
+            drawLine(
+                color = androidx.compose.ui.graphics.Color.Gray,
+                start = androidx.compose.ui.geometry.Offset(padding, size.height - padding),
+                end = androidx.compose.ui.geometry.Offset(size.width - padding, size.height - padding),
+                strokeWidth = 2.dp.toPx()
+            )
+            
+            // Draw ENMO data
+            if (enmoValues.isNotEmpty()) {
+                val stepX = chartWidth / (enmoValues.size - 1).coerceAtLeast(1)
+                val path = androidx.compose.ui.graphics.Path()
+                
+                enmoValues.forEachIndexed { index, value ->
+                    val x = padding + index * stepX
+                    val y = size.height - padding - ((value - minY).toFloat() / yRange.toFloat() * chartHeight)
+                    
+                    if (index == 0) {
+                        path.moveTo(x, y)
+                    } else {
+                        path.lineTo(x, y)
+                    }
+                }
+                
+                drawPath(
+                    path = path,
+                    color = androidx.compose.ui.graphics.Color.Blue,
+                    style = androidx.compose.ui.graphics.drawscope.Stroke(width = 2.dp.toPx())
+                )
+            }
+            
+            // Draw cosinor fit
+            if (cosinorFit.isNotEmpty() && cosinorFit.size == enmoValues.size) {
+                val stepX = chartWidth / (cosinorFit.size - 1).coerceAtLeast(1)
+                val path = androidx.compose.ui.graphics.Path()
+                
+                cosinorFit.forEachIndexed { index, value ->
+                    val x = padding + index * stepX
+                    val y = size.height - padding - ((value - minY).toFloat() / yRange.toFloat() * chartHeight)
+                    
+                    if (index == 0) {
+                        path.moveTo(x, y)
+                    } else {
+                        path.lineTo(x, y)
+                    }
+                }
+                
+                drawPath(
+                    path = path,
+                    color = androidx.compose.ui.graphics.Color.Red,
+                    style = androidx.compose.ui.graphics.drawscope.Stroke(width = 2.dp.toPx())
+                )
+            }
+            
+            // Draw Y-axis label (rotated) - positioned on the left side
+            val yAxisPaint = android.graphics.Paint().apply {
+                color = android.graphics.Color.GRAY
+                textSize = 12f * density
+                textAlign = android.graphics.Paint.Align.CENTER
+            }
+            val nativeCanvas = drawContext.canvas.nativeCanvas
+            nativeCanvas.save()
+            nativeCanvas.translate(15.dp.toPx(), size.height / 2)
+            nativeCanvas.rotate(-90f)
+            nativeCanvas.drawText("ENMO (mg)", 0f, 0f, yAxisPaint)
+            nativeCanvas.restore()
+            
+            // Draw X-axis label - positioned at the bottom center
+            val xAxisPaint = android.graphics.Paint().apply {
+                color = android.graphics.Color.GRAY
+                textSize = 12f * density
+                textAlign = android.graphics.Paint.Align.CENTER
+            }
+            drawContext.canvas.nativeCanvas.drawText(
+                "Time (minutes)",
+                size.width / 2 - 50.dp.toPx(),
+                size.height - 10.dp.toPx(),
+                xAxisPaint
+            )
+            }
+        }
+        
+        // Legend - now below the chart
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 8.dp),
+            horizontalArrangement = androidx.compose.foundation.layout.Arrangement.Center
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.padding(end = 16.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(16.dp)
+                        .background(androidx.compose.ui.graphics.Color.Blue)
+                )
+                Text(" ENMO Data", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(start = 4.dp))
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    modifier = Modifier
+                        .size(16.dp)
+                        .background(androidx.compose.ui.graphics.Color.Red)
+                )
+                Text(" Cosinor Fit", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(start = 4.dp))
+            }
+        }
     }
 }
 
