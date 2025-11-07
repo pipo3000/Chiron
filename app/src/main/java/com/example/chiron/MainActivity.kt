@@ -245,25 +245,123 @@ fun SkullWithPrediction(
     var biologicalAge by remember { mutableStateOf<Double?>(null) }
     var isLoadingAge by remember { mutableStateOf(false) }
     var ageMessage by remember { mutableStateOf("") }
-    var lastPredictionDate by remember { mutableStateOf<String?>(null) }
+    
+    // Load last prediction date and file hash from SharedPreferences (persistent storage)
+    val prefs = remember { context.getSharedPreferences("ChironPrefs", android.content.Context.MODE_PRIVATE) }
+    
+    // Clear prediction cache on first load after code update (to force recalculation with ENMO fixes)
+    // This ensures old predictions with buggy ENMO values get recalculated
+    val predictionCacheVersion = prefs.getInt("prediction_cache_version", 0)
+    val CURRENT_CACHE_VERSION = 2  // Increment when ENMO calculation changes
+    if (predictionCacheVersion < CURRENT_CACHE_VERSION) {
+        prefs.edit().apply {
+            remove("last_prediction_date")
+            remove("last_prediction_file_hash")
+            putInt("prediction_cache_version", CURRENT_CACHE_VERSION)
+            apply()
+        }
+        android.util.Log.d("MainActivity", "Cleared prediction cache due to version update (ENMO fix)")
+    }
+    
+    var lastPredictionDate by remember { 
+        mutableStateOf(prefs.getString("last_prediction_date", null))
+    }
+    var lastPredictionFileHash by remember {
+        mutableStateOf(prefs.getString("last_prediction_file_hash", null))
+    }
+
+    // Helper function to compute hash of files used for prediction
+    suspend fun computePredictionFileHash(): String {
+        return withContext(Dispatchers.IO) {
+            val files = CosinorAgePredictor.getAllPreviousDayFiles(context, maxDays = 14)
+            // Create a hash based on file names, sizes, and modification times
+            val hashString = files.sortedBy { it.name }.joinToString("|") { 
+                "${it.name}:${it.length()}:${it.lastModified()}"
+            }
+            // Simple hash (can use proper hash function if needed)
+            hashString.hashCode().toString()
+        }
+    }
+
+    // Helper function to save last prediction info persistently
+    fun saveLastPredictionInfo(date: String, fileHash: String) {
+        prefs.edit().apply {
+            putString("last_prediction_date", date)
+            putString("last_prediction_file_hash", fileHash)
+            apply()
+        }
+        lastPredictionDate = date
+        lastPredictionFileHash = fileHash
+    }
+
+    // Helper function to check if we need to update prediction
+    // Updates if: date changed, files changed, or never predicted
+    // NOTE: Always recalculates on app startup to ensure ENMO corrections are applied
+    suspend fun shouldUpdatePrediction(forceRecalculate: Boolean = false): Boolean {
+        return withContext(Dispatchers.IO) {
+            val dateFormat = java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.getDefault())
+            val currentDate = dateFormat.format(java.util.Date())
+            
+            // Check if we have files to use
+            val files = CosinorAgePredictor.getAllPreviousDayFiles(context, maxDays = 14)
+            if (files.isEmpty()) {
+                return@withContext false
+            }
+            
+            // Compute current file hash
+            val currentFileHash = computePredictionFileHash()
+            
+            // Update if:
+            // 1. Force recalculate (e.g., on app startup to apply ENMO corrections)
+            // 2. Never predicted
+            // 3. Date changed (new day with potentially new complete data)
+            // 4. Files changed (new files added, files modified)
+            val needsUpdate = forceRecalculate ||
+                             lastPredictionDate == null || 
+                             lastPredictionDate != currentDate || 
+                             lastPredictionFileHash != currentFileHash
+            
+            if (needsUpdate) {
+                android.util.Log.d("MainActivity", "Prediction update needed: forceRecalculate=$forceRecalculate, dateChanged=${lastPredictionDate != currentDate}, filesChanged=${lastPredictionFileHash != currentFileHash}, currentFiles=${files.size}")
+            }
+            
+            return@withContext needsUpdate
+        }
+    }
 
     // Helper function to load/refresh biological age prediction
     fun loadBiologicalAge() {
+        if (isLoadingAge) return // Prevent concurrent loads
+        
         coroutineScope.launch(Dispatchers.IO) {
             try {
                 isLoadingAge = true
                 // Use previous days' files (not today) for prediction
                 val result = CosinorAgePredictor.predictCosinorAgeFromPreviousDays(context, age = 39, gender = "male")
 
+                // Compute file hash for tracking
+                val fileHash = computePredictionFileHash()
+                
                 withContext(Dispatchers.Main) {
                     if (result.success && result.cosinorAge != null) {
+                        val oldBiologicalAge = biologicalAge
                         biologicalAge = result.cosinorAge
                         ageMessage = ""
-                        // Update last prediction date
+                        
+                        // Log if prediction changed
+                        if (oldBiologicalAge != null && oldBiologicalAge != result.cosinorAge) {
+                            android.util.Log.d("MainActivity", "Biological age updated: ${oldBiologicalAge} -> ${result.cosinorAge}")
+                        } else if (oldBiologicalAge != null && oldBiologicalAge == result.cosinorAge) {
+                            android.util.Log.d("MainActivity", "Biological age unchanged: ${result.cosinorAge}")
+                        }
+                        
+                        // Save last prediction info persistently (date + file hash)
                         val dateFormat = java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.getDefault())
-                        lastPredictionDate = dateFormat.format(java.util.Date())
+                        val currentDate = dateFormat.format(java.util.Date())
+                        saveLastPredictionInfo(currentDate, fileHash)
                     } else {
                         ageMessage = result.message
+                        // Don't update lastPredictionDate if prediction failed
                     }
                     isLoadingAge = false
                 }
@@ -278,7 +376,16 @@ fun SkullWithPrediction(
 
     // Load biological age on composition (using previous files)
     LaunchedEffect(Unit) {
-        loadBiologicalAge()
+        // Always load prediction on startup to display it
+        // Force recalculation on startup to ensure ENMO corrections are applied
+        coroutineScope.launch(Dispatchers.IO) {
+            // Always recalculate on startup to ensure:
+            // 1. ENMO corrections from old buggy files are applied
+            // 2. Latest cosinor parameters are computed
+            // 3. Prediction reflects current data state
+            android.util.Log.d("MainActivity", "Loading biological age prediction on startup")
+            loadBiologicalAge()
+        }
     }
 
     // Update recording state and file count periodically, and check for new day
@@ -291,23 +398,12 @@ fun SkullWithPrediction(
                         onUpdateRecordingState()
                     }
                     
-                    // Check if a new day has started and refresh prediction if needed
-                    val dateFormat = java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.getDefault())
-                    val currentDate = dateFormat.format(java.util.Date())
-                    var shouldRefresh = false
-                    
+                    // Check if a new day has started with complete data and refresh prediction if needed
+                    val shouldUpdate = shouldUpdatePrediction()
                     withContext(Dispatchers.Main) {
-                        if (lastPredictionDate != null && lastPredictionDate != currentDate) {
-                            // New day detected - refresh prediction
-                            shouldRefresh = true
-                        } else if (lastPredictionDate == null) {
-                            // First time - load prediction
-                            shouldRefresh = true
+                        if (shouldUpdate && !isLoadingAge) {
+                            loadBiologicalAge()
                         }
-                    }
-                    
-                    if (shouldRefresh && !isLoadingAge) {
-                        loadBiologicalAge()
                     }
                     
                     // Count recorded files - check both Downloads and app storage

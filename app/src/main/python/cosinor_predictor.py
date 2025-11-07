@@ -226,6 +226,25 @@ def process_csv_file(csv_file_path, age=40, gender='male'):
             result['message'] = "No valid data found in CSV file"
             return result
         
+        # Check if ENMO values appear to be in wrong units (from old buggy code)
+        # Old bug: ENMO = magnitude_mps2 - 1.0 (resulting in ~8.8 when still)
+        # Correct: ENMO = (magnitude_mps2 / 9.80665) - 1.0 (resulting in ~0.0 when still)
+        enmo_mean = df['enmo'].mean()
+        if enmo_mean > 1.0:
+            print(f"[WARNING] ENMO values appear to be in wrong units (mean={enmo_mean:.4f} g).", file=sys.stderr)
+            print(f"[WARNING] Expected ENMO range: 0.01-0.2 g. These values might be from old buggy code.", file=sys.stderr)
+            print(f"[WARNING] Attempting to correct: assuming old formula was ENMO = magnitude_mps2 - 1.0", file=sys.stderr)
+            print(f"[WARNING] Converting: new_ENMO = (old_ENMO + 1.0) / 9.80665 - 1.0", file=sys.stderr)
+            # Convert from old buggy ENMO to correct ENMO
+            # Old: ENMO_old = magnitude_mps2 - 1.0
+            # We want: ENMO_new = (magnitude_mps2 / 9.80665) - 1.0
+            # So: magnitude_mps2 = ENMO_old + 1.0
+            # And: ENMO_new = ((ENMO_old + 1.0) / 9.80665) - 1.0
+            GRAVITY_MS2 = 9.80665
+            df['enmo'] = ((df['enmo'] + 1.0) / GRAVITY_MS2) - 1.0
+            df['enmo'] = df['enmo'].clip(lower=0)  # ENMO cannot be negative
+            print(f"[WARNING] Corrected ENMO mean: {df['enmo'].mean():.4f} g", file=sys.stderr)
+        
         # Sort by timestamp and remove duplicates
         df = df.sort_values('timestamp').reset_index(drop=True)
         df = df.drop_duplicates(subset=['timestamp'], keep='first')
@@ -398,6 +417,17 @@ def process_csv_file(csv_file_path, age=40, gender='male'):
                         enmo_series = preprocessed_df['enmo']
                         
                         if len(enmo_series) > 0:
+                            # Check ENMO values - they should be in reasonable range (0.01-0.2 g typically)
+                            enmo_min = float(enmo_series.min())
+                            enmo_max = float(enmo_series.max())
+                            enmo_mean = float(enmo_series.mean())
+                            print(f"[DEBUG] ENMO statistics: min={enmo_min:.4f}, max={enmo_max:.4f}, mean={enmo_mean:.4f} g", file=sys.stderr)
+                            
+                            # Warn if ENMO values seem too high (might be in wrong units)
+                            if enmo_mean > 1.0:
+                                print(f"[WARNING] ENMO mean ({enmo_mean:.4f} g) is unusually high! Expected range: 0.01-0.2 g", file=sys.stderr)
+                                print(f"[WARNING] This might indicate ENMO values are in wrong units (m/s² instead of g?)", file=sys.stderr)
+                            
                             period = 1440.0  # 24 hours in minutes
                             # Explicitly reference numpy to avoid any scoping issues
                             import numpy
@@ -417,6 +447,7 @@ def process_csv_file(csv_file_path, age=40, gender='male'):
                             computed_phi1 = float(numpy.arctan2(-amplitude_sin, amplitude_cos))
                             
                             print(f"[DEBUG] Pre-computed manually: mesor={computed_mesor:.4f}, amp1={computed_amp1:.4f}, phi1={computed_phi1:.4f}", file=sys.stderr)
+                            print(f"[DEBUG] Note: mesor should typically be 0.01-0.2 g for ENMO data. If much higher, check ENMO calculation.", file=sys.stderr)
                         else:
                             print(f"[DEBUG] Preprocessed data is empty", file=sys.stderr)
                 else:
@@ -483,6 +514,13 @@ def process_csv_file(csv_file_path, age=40, gender='male'):
                                         'age': age
                                     }
                                     
+                                    # Warn if cosinor parameters seem wrong (mesor too high)
+                                    if computed_mesor > 1.0:
+                                        print(f"[WARNING] Mesor ({computed_mesor:.4f} g) is unusually high! Expected: 0.01-0.2 g", file=sys.stderr)
+                                        print(f"[WARNING] This suggests ENMO values might still be in wrong units.", file=sys.stderr)
+                                    
+                                    print(f"[DEBUG] Using cosinor parameters for prediction: mesor={computed_mesor:.6f}, amp1={computed_amp1:.6f}, phi1={computed_phi1:.6f}", file=sys.stderr)
+                                    
                                     # Compute xb = sum(bm_data[key] * coef[key]) + coef["rate"]
                                     n1 = {key: bm_data[key] * coef[key] for key in bm_data}
                                     xb = sum(n1.values()) + coef['rate']
@@ -500,6 +538,7 @@ def process_csv_file(csv_file_path, age=40, gender='male'):
                                     
                                     print(f"[DEBUG] Computed cosinorage using reference formula: predicted_age={predicted_age:.2f}, age_advance={age_advance:.2f}", file=sys.stderr)
                                     print(f"[DEBUG] Formula: xb={xb:.4f}, m_val={m_val:.4f}, predicted_age={predicted_age:.2f}", file=sys.stderr)
+                                    print(f"[DEBUG] Input parameters: mesor={computed_mesor:.6f}, amp1={computed_amp1:.6f}, phi1={computed_phi1:.6f}, age={age}", file=sys.stderr)
                                 except Exception as e:
                                     print(f"[DEBUG] Error computing cosinorage using reference formula: {e}", file=sys.stderr)
                                     import traceback
@@ -679,6 +718,16 @@ def get_visualization_data(csv_file_path, age=None, gender=None):
         
         df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
         df = df.dropna(subset=['timestamp', 'enmo'])
+        
+        # Check if ENMO values appear to be in wrong units (from old buggy code)
+        enmo_mean = df['enmo'].mean()
+        if enmo_mean > 1.0:
+            print(f"[WARNING] ENMO values appear to be in wrong units (mean={enmo_mean:.4f} g). Correcting...", file=sys.stderr)
+            GRAVITY_MS2 = 9.80665
+            df['enmo'] = ((df['enmo'] + 1.0) / GRAVITY_MS2) - 1.0
+            df['enmo'] = df['enmo'].clip(lower=0)
+            print(f"[WARNING] Corrected ENMO mean: {df['enmo'].mean():.4f} g", file=sys.stderr)
+        
         df = df.sort_values('timestamp').reset_index(drop=True)
         df = df.drop_duplicates(subset=['timestamp'], keep='first')
         
