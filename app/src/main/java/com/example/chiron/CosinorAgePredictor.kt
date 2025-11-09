@@ -467,7 +467,7 @@ object CosinorAgePredictor {
     /**
      * Collects all previous day files (excluding today) from all Chiron directories.
      */
-    fun getAllPreviousDayFiles(context: Context, maxDays: Int = 14): List<File> {
+    fun getAllPreviousDayFiles(context: Context, maxDays: Int? = 7): List<File> {
         // Only use Downloads/Chiron folder, not app storage
         val chironDir = getChironDir()
         if (chironDir == null || !chironDir.exists() || !chironDir.isDirectory) {
@@ -479,16 +479,20 @@ object CosinorAgePredictor {
         // Get today's date and calculate cutoff date (maxDays ago)
         val calendar = java.util.Calendar.getInstance()
         val today = calendar.time
-        
-        calendar.add(java.util.Calendar.DAY_OF_YEAR, -maxDays)
-        val cutoffDate = calendar.time
+
+        val cutoffDate = if (maxDays != null) {
+            calendar.add(java.util.Calendar.DAY_OF_YEAR, -maxDays)
+            calendar.time
+        } else {
+            null
+        }
         
         val dateFormat = java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.getDefault())
         val todayStr = dateFormat.format(today)
-        val cutoffDateStr = dateFormat.format(cutoffDate)
+        val cutoffDateStr = cutoffDate?.let { dateFormat.format(it) } ?: "ALL"
         val todayFileName = "accelerometer_$todayStr.csv"
         
-        android.util.Log.d("CosinorAgePredictor", "Filtering files: today=$todayStr, cutoff=$cutoffDateStr (last $maxDays days)")
+        android.util.Log.d("CosinorAgePredictor", "Filtering files: today=$todayStr, cutoff=$cutoffDateStr (maxDays=${maxDays ?: "ALL"})")
         
         // Collect files from all directories, excluding today's file and files older than maxDays
         val allPreviousFiles = mutableListOf<File>()
@@ -512,7 +516,9 @@ object CosinorAgePredictor {
                     val dateStr = file.name.removePrefix("accelerometer_").removeSuffix(".csv")
                     if (dateStr.length == 8) {
                         val fileDate = dateFormat.parse(dateStr)
-                        if (fileDate != null && fileDate >= cutoffDate && fileDate < today) {
+                        if (fileDate != null &&
+                            (cutoffDate == null || fileDate >= cutoffDate) &&
+                            fileDate < today) {
                             allPreviousFiles.add(file)
                         }
                     }
@@ -534,6 +540,36 @@ object CosinorAgePredictor {
         android.util.Log.d("CosinorAgePredictor", "Found ${allPreviousFiles.size} files, ${sortedFiles.size} unique: ${sortedFiles.map { it.name }}")
         
         return sortedFiles
+    }
+
+    /**
+     * Returns all available accelerometer files (including today's partial file) for visualization.
+     */
+    fun getAllAvailableFiles(context: Context): List<File> {
+        val chironDir = getChironDir()
+        if (chironDir == null || !chironDir.exists() || !chironDir.isDirectory) {
+            android.util.Log.w("CosinorAgePredictor", "getAllAvailableFiles: Downloads/Chiron directory not found")
+            return emptyList()
+        }
+
+        val dirs = listOf(chironDir)
+        val collected = mutableListOf<File>()
+
+        for (dir in dirs) {
+            if (!dir.exists() || !dir.isDirectory) continue
+
+            val files = dir.listFiles { _, name ->
+                name.startsWith("accelerometer_") && name.endsWith(".csv")
+            } ?: continue
+
+            collected.addAll(files)
+        }
+
+        val uniqueFiles = collected
+            .groupBy { it.name }
+            .map { (_, files) -> files.first() }
+
+        return uniqueFiles.sortedBy { it.name }
     }
     
     /**
@@ -597,10 +633,15 @@ object CosinorAgePredictor {
      * Predicts CosinorAge using all previous day files concatenated together.
      * Useful for predictions where we want complete data from previous days.
      */
-    fun predictCosinorAgeFromPreviousDays(context: Context, age: Int? = null, gender: String? = null): CosinorAgeResult {
-        android.util.Log.d("CosinorAgePredictor", "predictCosinorAgeFromPreviousDays: Starting search for previous day files (last 14 days)")
+    fun predictCosinorAgeFromPreviousDays(
+        context: Context,
+        age: Int? = null,
+        gender: String? = null,
+        maxDays: Int? = 14
+    ): CosinorAgeResult {
+        android.util.Log.d("CosinorAgePredictor", "predictCosinorAgeFromPreviousDays: Starting search for previous day files (maxDays=${maxDays ?: "ALL"})")
         
-        val files = getAllPreviousDayFiles(context, maxDays = 14)
+        val files = getAllPreviousDayFiles(context, maxDays = maxDays)
         if (files.isEmpty()) {
             // Try to get all directories and list files for better error message
             val dirs = getAllChironDirs(context)
@@ -764,13 +805,29 @@ object CosinorAgePredictor {
                 if (paramsObj.has("acrophase")) cosinorParams["acrophase"] = paramsObj.getDouble("acrophase")
             }
 
+            val fitMetadata = mutableMapOf<String, String>()
+            if (json.has("fit_metadata")) {
+                val metadataObj = json.getJSONObject("fit_metadata")
+                metadataObj.keys().forEach { key ->
+                    fitMetadata[key] = metadataObj.getString(key)
+                }
+            }
+
+            val rhythmRobustness = if (json.has("rhythm_robustness") && !json.isNull("rhythm_robustness")) {
+                json.getDouble("rhythm_robustness")
+            } else {
+                null
+            }
+
             VisualizationDataResult(
                 success = success,
                 message = message,
                 timestamps = timestamps,
                 enmoValues = enmoValues,
                 cosinorFit = cosinorFit,
-                cosinorParams = cosinorParams
+                cosinorParams = cosinorParams,
+                fitMetadata = fitMetadata,
+                rhythmRobustness = rhythmRobustness
             )
         } catch (e: Exception) {
             android.util.Log.e("CosinorAgePredictor", "Error getting visualization data: ${e.message}", e)
@@ -788,5 +845,7 @@ data class VisualizationDataResult(
     val timestamps: List<String> = emptyList(),
     val enmoValues: List<Double> = emptyList(),
     val cosinorFit: List<Double> = emptyList(),
-    val cosinorParams: Map<String, Double> = emptyMap()
+    val cosinorParams: Map<String, Double> = emptyMap(),
+    val fitMetadata: Map<String, String> = emptyMap(),
+    val rhythmRobustness: Double? = null
 )

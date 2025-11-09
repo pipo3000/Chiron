@@ -81,25 +81,26 @@ try:
                             f"Full traceback:\n{traceback.format_exc()}")
     
     # Try to get the classes from their submodules
+    import importlib
     # GenericDataHandler is in cosinorage.datahandlers
     try:
-        datahandlers_module = cosinorage_module.datahandlers
+        datahandlers_module = importlib.import_module("cosinorage.datahandlers")
         if hasattr(datahandlers_module, 'GenericDataHandler'):
             GenericDataHandler = datahandlers_module.GenericDataHandler
         else:
             raise ImportError("GenericDataHandler not found in cosinorage.datahandlers")
-    except AttributeError:
-        raise ImportError("cosinorage.datahandlers submodule not found")
+    except Exception as e:
+        raise ImportError(f"cosinorage.datahandlers submodule not found: {e}")
     
     # CosinorAge is in cosinorage.bioages
     try:
-        bioages_module = cosinorage_module.bioages
+        bioages_module = importlib.import_module("cosinorage.bioages")
         if hasattr(bioages_module, 'CosinorAge'):
             CosinorAge = bioages_module.CosinorAge
         else:
             raise ImportError("CosinorAge not found in cosinorage.bioages")
-    except AttributeError:
-        raise ImportError("cosinorage.bioages submodule not found")
+    except Exception as e:
+        raise ImportError(f"cosinorage.bioages submodule not found: {e}")
     
     # Import constants for age computation from cosinorage.bioages.cosinorage
     try:
@@ -768,100 +769,111 @@ def get_visualization_data(csv_file_path, age=None, gender=None):
             result['timestamps'] = timestamp_strs
             result['enmo_values'] = enmo_series.tolist()
             
-            # Compute cosinor fit using cosinor_multiday (preferred) or manual computation
+            # Compute cosinor fits
+            minutes_per_day = 1440
+            total_minutes = len(ml_data)
+            full_days = total_minutes // minutes_per_day
+            
+            if full_days > 0:
+                trimmed_minutes = full_days * minutes_per_day
+                ml_data_trimmed = ml_data.iloc[:trimmed_minutes].copy()
+            else:
+                trimmed_minutes = len(ml_data)
+                ml_data_trimmed = ml_data.copy()
+            
+            primary_series = ml_data_trimmed.iloc[:, 0] if len(ml_data_trimmed.columns) > 0 else ml_data_trimmed.squeeze()
+            full_series = enmo_series
+            
             mesor = None
             amplitude = None
             acrophase = None
             cosinor_fit = None
             
             try:
-                # Try to use cosinor_multiday if available
-                if cosinor_multiday is not None and ml_data is not None and len(ml_data) > 0:
+                # Preferred: use cosinor_multiday on trimmed full-day data
+                if cosinor_multiday is not None and len(primary_series) > 0:
                     try:
-                        minutes_per_day = 1440
-                        total_minutes = len(ml_data)
-                        full_days = total_minutes // minutes_per_day
+                        cosinor_result, fitted_data = cosinor_multiday(ml_data_trimmed)
                         
-                        if full_days > 0:
-                            trimmed_minutes = full_days * minutes_per_day
-                            ml_data_trimmed = ml_data.iloc[:trimmed_minutes].copy()
+                        if cosinor_result and fitted_data is not None:
+                            mesor = float(cosinor_result.get('mesor', 0))
+                            amplitude = float(cosinor_result.get('amplitude', 0))
+                            acrophase = float(cosinor_result.get('acrophase', 0))
                             
-                            # cosinor_multiday returns a tuple: (params_dict, fitted_data)
-                            cosinor_result, fitted_data = cosinor_multiday(ml_data_trimmed)
+                            period = 1440.0
+                            t_full = np.arange(len(full_series))
+                            cosinor_fit = mesor + amplitude * np.cos(2 * np.pi * t_full / period + acrophase)
+                            cosinor_fit = cosinor_fit.tolist()
                             
-                            if cosinor_result and fitted_data is not None:
-                                mesor = float(cosinor_result.get('mesor', 0))
-                                amplitude = float(cosinor_result.get('amplitude', 0))
-                                acrophase = float(cosinor_result.get('acrophase', 0))
-                                
-                                # Use the fitted_data from cosinor_multiday
-                                # Map it back to the preprocessed data length if needed
-                                if hasattr(fitted_data, 'values'):
-                                    fit_values = fitted_data.values
-                                elif hasattr(fitted_data, 'tolist'):
-                                    fit_values = fitted_data.tolist()
-                                else:
-                                    fit_values = list(fitted_data)
-                                
-                                # If fitted_data length matches, use it directly
-                                # Otherwise, compute fit using the parameters
-                                if len(fit_values) == len(enmo_series):
-                                    cosinor_fit = fit_values
-                                else:
-                                    # Compute fit using the parameters for the full length
-                                    period = 1440.0
-                                    t = np.arange(len(enmo_series))
-                                    cosinor_fit = mesor + amplitude * np.cos(2 * np.pi * t / period + acrophase)
-                                    cosinor_fit = cosinor_fit.tolist()
-                                
-                                print(f"[DEBUG] Visualization: Used cosinor_multiday, mesor={mesor:.4f}, amplitude={amplitude:.4f}, acrophase={acrophase:.4f}", file=sys.stderr)
+                            print(f"[DEBUG] Visualization: Primary fit (trimmed {full_days} full day(s)), mesor={mesor:.4f}, amplitude={amplitude:.4f}, acrophase={acrophase:.4f}", file=sys.stderr)
                     except Exception as e:
                         print(f"[DEBUG] cosinor_multiday failed for visualization: {e}, falling back to manual computation", file=sys.stderr)
-                        # Fall through to manual computation
+                        # Continue to manual computation
                 
-                # Fallback: manual computation
+                # Manual computation for primary fit if needed
                 if cosinor_fit is None or mesor is None or amplitude is None or acrophase is None:
-                    print(f"[DEBUG] Computing cosinor fit manually for visualization", file=sys.stderr)
-                    if len(enmo_series) > 0:
-                        period = 1440.0  # 24 hours in minutes
-                        t = np.arange(len(enmo_series))
-                        
-                        # Linear regression: y = M + A_cos*cos + A_sin*sin
-                        cos_term = np.cos(2 * np.pi * t / period)
-                        sin_term = np.sin(2 * np.pi * t / period)
-                        X = np.column_stack([np.ones(len(t)), cos_term, sin_term])
-                        coeffs = np.linalg.lstsq(X, enmo_series.values, rcond=None)[0]
+                    if len(primary_series) > 0:
+                        period = 1440.0
+                        t_trimmed = np.arange(len(primary_series))
+                        cos_term = np.cos(2 * np.pi * t_trimmed / period)
+                        sin_term = np.sin(2 * np.pi * t_trimmed / period)
+                        X = np.column_stack([np.ones(len(t_trimmed)), cos_term, sin_term])
+                        coeffs = np.linalg.lstsq(X, primary_series.values, rcond=None)[0]
                         
                         mesor = float(coeffs[0])
-                        amplitude_cos = float(coeffs[1])
-                        amplitude_sin = float(coeffs[2])
-                        amplitude = float(np.sqrt(amplitude_cos**2 + amplitude_sin**2))
-                        acrophase = float(np.arctan2(-amplitude_sin, amplitude_cos))
+                        amp_cos = float(coeffs[1])
+                        amp_sin = float(coeffs[2])
+                        amplitude = float(np.sqrt(amp_cos**2 + amp_sin**2))
+                        acrophase = float(np.arctan2(-amp_sin, amp_cos))
                         
-                        # Compute fit values
-                        cosinor_fit = mesor + amplitude * np.cos(2 * np.pi * t / period + acrophase)
+                        t_full = np.arange(len(full_series))
+                        cosinor_fit = mesor + amplitude * np.cos(2 * np.pi * t_full / period + acrophase)
                         cosinor_fit = cosinor_fit.tolist()
+                        
+                        print(f"[DEBUG] Visualization: Primary manual fit (trimmed), mesor={mesor:.4f}, amplitude={amplitude:.4f}, acrophase={acrophase:.4f}", file=sys.stderr)
                 
-                if cosinor_fit is not None and mesor is not None and amplitude is not None and acrophase is not None:
-                    result['cosinor_fit'] = cosinor_fit
-                    result['cosinor_params'] = {
-                        'mesor': mesor,
-                        'amplitude': amplitude,
-                        'acrophase': acrophase
-                    }
-                    result['success'] = True
-                    result['message'] = "Visualization data computed successfully"
-                else:
-                    result['message'] = "ENMO data available, but cosinor fit computation failed"
-                    result['success'] = True  # Still return ENMO data
-                    
             except Exception as e:
-                # If cosinor fit fails, just return ENMO data
-                result['message'] = f"ENMO data available, but cosinor fit failed: {str(e)}"
-                result['success'] = True  # Still return ENMO data
-                print(f"[DEBUG] Visualization cosinor fit error: {e}", file=sys.stderr)
+                print(f"[DEBUG] Visualization cosinor computation encountered error: {e}", file=sys.stderr)
                 import traceback
                 print(f"[DEBUG] Traceback: {traceback.format_exc()}", file=sys.stderr)
+            
+            if cosinor_fit is not None and mesor is not None and amplitude is not None and acrophase is not None:
+                # Compute rhythm robustness (R^2) if possible
+                try:
+                    observed = full_series.values.astype(float)
+                    fitted = np.array(cosinor_fit, dtype=float)
+                    if len(observed) == len(fitted) and len(observed) > 1:
+                        sse = np.sum((observed - fitted) ** 2)
+                        sst = np.sum((observed - np.mean(observed)) ** 2)
+                        if sst > 0:
+                            rhythm_robustness = 1.0 - (sse / sst)
+                        else:
+                            rhythm_robustness = None
+                    else:
+                        rhythm_robustness = None
+                except Exception as e:
+                    rhythm_robustness = None
+                    print(f"[DEBUG] Failed to compute rhythm robustness: {e}", file=sys.stderr)
+
+                result['cosinor_fit'] = cosinor_fit
+                result['cosinor_params'] = {
+                    'mesor': mesor,
+                    'amplitude': amplitude,
+                    'acrophase': acrophase
+                }
+                if rhythm_robustness is not None:
+                    result['rhythm_robustness'] = float(rhythm_robustness)
+                result['success'] = True
+                result['message'] = "Visualization data computed successfully"
+            else:
+                result['message'] = "ENMO data available, but cosinor fit computation failed"
+                result['success'] = True  # Still return ENMO data
+            
+            result['fit_metadata'] = {
+                'primary_source': f"Trimmed to {full_days} full day(s)" if full_days > 0 else "Dataset shorter than one full day",
+                'primary_minutes': str(trimmed_minutes),
+                'total_minutes': str(total_minutes)
+            }
                 
         except Exception as e:
             result['message'] = f"Error processing data with GenericDataHandler: {str(e)}"

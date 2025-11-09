@@ -61,6 +61,7 @@ import androidx.compose.ui.unit.dp
 import com.example.chiron.R
 import com.example.chiron.ui.theme.ChironTheme
 import com.example.chiron.ui.theme.ExplosivePurple
+import java.util.Locale
 
 class MainActivity : ComponentActivity() {
     private var accelerometerService: AccelerometerDataService? = null
@@ -273,7 +274,7 @@ fun SkullWithPrediction(
     // Helper function to compute hash of files used for prediction
     suspend fun computePredictionFileHash(): String {
         return withContext(Dispatchers.IO) {
-            val files = CosinorAgePredictor.getAllPreviousDayFiles(context, maxDays = 14)
+            val files = CosinorAgePredictor.getAllPreviousDayFiles(context, maxDays = 7)
             // Create a hash based on file names, sizes, and modification times
             val hashString = files.sortedBy { it.name }.joinToString("|") { 
                 "${it.name}:${it.length()}:${it.lastModified()}"
@@ -303,7 +304,7 @@ fun SkullWithPrediction(
             val currentDate = dateFormat.format(java.util.Date())
             
             // Check if we have files to use
-            val files = CosinorAgePredictor.getAllPreviousDayFiles(context, maxDays = 14)
+            val files = CosinorAgePredictor.getAllPreviousDayFiles(context, maxDays = 7)
             if (files.isEmpty()) {
                 return@withContext false
             }
@@ -336,38 +337,41 @@ fun SkullWithPrediction(
         coroutineScope.launch(Dispatchers.IO) {
             try {
                 isLoadingAge = true
-                // Use previous days' files (not today) for prediction
-                val result = CosinorAgePredictor.predictCosinorAgeFromPreviousDays(context, age = 39, gender = "male")
-
-                // Compute file hash for tracking
                 val fileHash = computePredictionFileHash()
-                
+
+                val result = CosinorAgePredictor.predictCosinorAgeFromPreviousDays(
+                    context = context,
+                    age = 39,
+                    gender = "male",
+                    maxDays = 7
+                )
+
+                val dateFormat = java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.getDefault())
+                val currentDate = dateFormat.format(java.util.Date())
+
                 withContext(Dispatchers.Main) {
                     if (result.success && result.cosinorAge != null) {
                         val oldBiologicalAge = biologicalAge
                         biologicalAge = result.cosinorAge
                         ageMessage = ""
-                        
-                        // Log if prediction changed
+
                         if (oldBiologicalAge != null && oldBiologicalAge != result.cosinorAge) {
                             android.util.Log.d("MainActivity", "Biological age updated: ${oldBiologicalAge} -> ${result.cosinorAge}")
                         } else if (oldBiologicalAge != null && oldBiologicalAge == result.cosinorAge) {
                             android.util.Log.d("MainActivity", "Biological age unchanged: ${result.cosinorAge}")
                         }
-                        
-                        // Save last prediction info persistently (date + file hash)
-                        val dateFormat = java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.getDefault())
-                        val currentDate = dateFormat.format(java.util.Date())
+
                         saveLastPredictionInfo(currentDate, fileHash)
                     } else {
-                        ageMessage = result.message
-                        // Don't update lastPredictionDate if prediction failed
+                        biologicalAge = null
+                        ageMessage = result.message.ifBlank { "Prediction unavailable" }
                     }
                     isLoadingAge = false
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
                     ageMessage = "Error: ${e.message}"
+                    biologicalAge = null
                     isLoadingAge = false
                 }
             }
@@ -446,7 +450,7 @@ fun SkullWithPrediction(
     ) {
         // Title above the image
         Text(
-            text = "LIVE LONG AND PROSPER",
+            text = "YOU ARE ONLY YOUNG, BUT YOU ARE GONNA DIE!",
             style = MaterialTheme.typography.displaySmall,
             fontWeight = FontWeight.Bold,
             textAlign = TextAlign.Center,
@@ -477,8 +481,9 @@ fun SkullWithPrediction(
                     modifier = Modifier.padding(bottom = 8.dp)
                 )
             } else if (biologicalAge != null) {
+                val formattedAge = String.format(Locale.US, "%.1f", biologicalAge!!)
                 Text(
-                    text = "Biological Age: ${String.format("%.1f", biologicalAge)} years",
+                    text = "Biological Age (last 7 days): $formattedAge years",
                     style = MaterialTheme.typography.headlineMedium,
                     fontWeight = FontWeight.Bold,
                     textAlign = TextAlign.Center,
@@ -577,6 +582,7 @@ fun DataVisualizationScreen() {
     var enmoValues by remember { mutableStateOf<List<Double>>(emptyList()) }
     var cosinorFit by remember { mutableStateOf<List<Double>>(emptyList()) }
     var cosinorParams by remember { mutableStateOf<Map<String, Double>>(emptyMap()) }
+    var rhythmRobustness by remember { mutableStateOf<Double?>(null) }
     
     // Load visualization data
     LaunchedEffect(Unit) {
@@ -585,8 +591,8 @@ fun DataVisualizationScreen() {
                 isLoading = true
                 errorMessage = null
                 
-                // Get previous day files (last 14 days)
-                val files = CosinorAgePredictor.getAllPreviousDayFiles(context, maxDays = 14)
+                // Use the same files as the prediction (last 7 full days, excluding today)
+                val files = CosinorAgePredictor.getAllPreviousDayFiles(context, maxDays = 7)
                 if (files.isEmpty()) {
                     errorMessage = "No data files available for visualization"
                     isLoading = false
@@ -625,6 +631,7 @@ fun DataVisualizationScreen() {
                         enmoValues = result.enmoValues
                         cosinorFit = result.cosinorFit
                         cosinorParams = result.cosinorParams
+                        rhythmRobustness = result.rhythmRobustness
                     } else {
                         errorMessage = result.message
                     }
@@ -683,6 +690,12 @@ fun DataVisualizationScreen() {
                     }
                     cosinorParams["acrophase"]?.let {
                         Text("Acrophase: ${String.format("%.4f", it)}", modifier = Modifier.padding(4.dp))
+                    }
+                    rhythmRobustness?.let {
+                        Text(
+                            text = "Rhythm Robustness (R²): ${String.format("%.3f", it)}",
+                            modifier = Modifier.padding(4.dp)
+                        )
                     }
                 }
             }
