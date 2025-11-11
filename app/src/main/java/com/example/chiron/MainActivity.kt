@@ -483,7 +483,7 @@ fun SkullWithPrediction(
             } else if (biologicalAge != null) {
                 val formattedAge = String.format(Locale.US, "%.1f", biologicalAge!!)
                 Text(
-                    text = "Biological Age (last 7 days): $formattedAge years",
+                    text = "Biological Age: $formattedAge years",
                     style = MaterialTheme.typography.headlineMedium,
                     fontWeight = FontWeight.Bold,
                     textAlign = TextAlign.Center,
