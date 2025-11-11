@@ -198,8 +198,20 @@ def process_csv_file(csv_file_path, age=40, gender='male'):
             result['python_path'] = str(sys.path)
             return result
         
-        # Read CSV file
-        df = pd.read_csv(csv_file_path)
+        # Read CSV file with explicit error handling
+        try:
+            df = pd.read_csv(csv_file_path)
+        except Exception as e:
+            result['message'] = f"Error reading CSV file: {str(e)}"
+            result['error'] = str(e)
+            import traceback
+            result['traceback'] = traceback.format_exc()
+            return result
+        
+        # Log column information for debugging
+        print(f"[DEBUG] CSV columns: {df.columns.tolist()}", file=sys.stderr)
+        print(f"[DEBUG] CSV dtypes: {df.dtypes.to_dict()}", file=sys.stderr)
+        print(f"[DEBUG] CSV shape: {df.shape}", file=sys.stderr)
         
         # Check if file is in new CosinorAge format (timestamp,enmo) or legacy format
         has_enmo_format = 'enmo' in df.columns and 'timestamp' in df.columns
@@ -207,16 +219,45 @@ def process_csv_file(csv_file_path, age=40, gender='male'):
         
         # Convert legacy x,y,z format to enmo if needed
         if has_xyz_format and not has_enmo_format:
-            # Calculate ENMO (Euclidean Norm Minus One)
-            # Note: Assumes accelerometer values are in m/s² (Android format)
-            # If values are already in g units, remove the /GRAVITY_MS2 conversion
-            GRAVITY_MS2 = 9.80665  # Standard gravity in m/s²
-            magnitude = np.sqrt(df['x']**2 + df['y']**2 + df['z']**2)
-            magnitude_g = magnitude / GRAVITY_MS2  # Convert m/s² to g units
-            df['enmo'] = (magnitude_g - 1.0).clip(lower=0)  # ENMO in g units
+            # Explicitly convert numeric columns to float, handling errors
+            try:
+                for col in ['x', 'y', 'z']:
+                    if col in df.columns:
+                        # Convert to numeric, coercing errors to NaN
+                        df[col] = pd.to_numeric(df[col], errors='coerce')
+                # Drop rows with invalid numeric values
+                df = df.dropna(subset=['x', 'y', 'z'])
+                
+                if len(df) == 0:
+                    result['message'] = "No valid numeric data found in x, y, z columns"
+                    return result
+                
+                # Calculate ENMO (Euclidean Norm Minus One)
+                # Note: Assumes accelerometer values are in m/s² (Android format)
+                # If values are already in g units, remove the /GRAVITY_MS2 conversion
+                GRAVITY_MS2 = 9.80665  # Standard gravity in m/s²
+                magnitude = np.sqrt(df['x']**2 + df['y']**2 + df['z']**2)
+                magnitude_g = magnitude / GRAVITY_MS2  # Convert m/s² to g units
+                df['enmo'] = (magnitude_g - 1.0).clip(lower=0)  # ENMO in g units
+            except Exception as e:
+                result['message'] = f"Error converting x, y, z columns to numeric: {str(e)}"
+                result['error'] = str(e)
+                import traceback
+                result['traceback'] = traceback.format_exc()
+                return result
         
         if 'enmo' not in df.columns or 'timestamp' not in df.columns:
             result['message'] = f"Unsupported CSV format. Expected 'timestamp,enmo' or 'timestamp,x,y,z'. Found: {df.columns.tolist()}"
+            return result
+        
+        # Convert ENMO to numeric if it's not already
+        try:
+            df['enmo'] = pd.to_numeric(df['enmo'], errors='coerce')
+        except Exception as e:
+            result['message'] = f"Error converting ENMO column to numeric: {str(e)}"
+            result['error'] = str(e)
+            import traceback
+            result['traceback'] = traceback.format_exc()
             return result
         
         # Convert timestamp to datetime and sort
@@ -250,14 +291,36 @@ def process_csv_file(csv_file_path, age=40, gender='male'):
         df = df.sort_values('timestamp').reset_index(drop=True)
         df = df.drop_duplicates(subset=['timestamp'], keep='first')
         
+        # Ensure ENMO is float64 (not object/string)
+        df['enmo'] = df['enmo'].astype('float64')
+        
+        # Ensure timestamp is datetime (not object/string)
+        if df['timestamp'].dtype == 'object':
+            df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+            df = df.dropna(subset=['timestamp'])
+        
         # Check minimum data requirement (at least 1 day = 1440 minutes)
         if len(df) < 1440:
             result['message'] = f"Insufficient data: need at least 1 day (1440 minutes), got {len(df)} rows"
             return result
         
+        # Format timestamp as ISO 8601 string for CSV output
+        df_output = df.copy()
+        df_output['timestamp'] = df_output['timestamp'].dt.strftime('%Y-%m-%dT%H:%M:%S')
+        
         # Save to temporary CSV file for GenericDataHandler
+        # Use explicit formatting to ensure numeric values are written correctly
         temp_file = str(Path(csv_file_path).parent / 'temp_combined_data.csv')
-        df.to_csv(temp_file, index=False)
+        try:
+            df_output.to_csv(temp_file, index=False, float_format='%.6f')
+            print(f"[DEBUG] Wrote temp file with {len(df_output)} rows", file=sys.stderr)
+            print(f"[DEBUG] Temp file ENMO range: {df_output['enmo'].min():.6f} to {df_output['enmo'].max():.6f}", file=sys.stderr)
+        except Exception as e:
+            result['message'] = f"Error writing temporary CSV file: {str(e)}"
+            result['error'] = str(e)
+            import traceback
+            result['traceback'] = traceback.format_exc()
+            return result
         
         # Keep a reference to the preprocessed DataFrame for manual computation if needed
         preprocessed_df = df.copy()
@@ -303,6 +366,16 @@ def process_csv_file(csv_file_path, age=40, gender='male'):
             # Initialize GenericDataHandler - following reference implementation
             # Use less strict parameters to allow data that might not be perfectly consecutive
             try:
+                # Verify the temp file exists and is readable
+                if not Path(temp_file).exists():
+                    raise FileNotFoundError(f"Temporary file not found: {temp_file}")
+                
+                # Read a sample of the temp file to verify format
+                sample_df = pd.read_csv(temp_file, nrows=5)
+                print(f"[DEBUG] Temp file sample columns: {sample_df.columns.tolist()}", file=sys.stderr)
+                print(f"[DEBUG] Temp file sample dtypes: {sample_df.dtypes.to_dict()}", file=sys.stderr)
+                print(f"[DEBUG] Temp file sample data:\n{sample_df.head()}", file=sys.stderr)
+                
                 data_handler = GenericDataHandler(
                     file_path=temp_file,
                     data_format='csv',
@@ -316,18 +389,50 @@ def process_csv_file(csv_file_path, age=40, gender='male'):
                     required_daily_coverage=0.0  # No minimum daily coverage required
                 )
                 print(f"[DEBUG] GenericDataHandler created with lenient parameters", file=sys.stderr)
-            except TypeError:
+            except TypeError as e:
                 # If these parameters don't exist, use default initialization
-                print(f"[DEBUG] GenericDataHandler doesn't support lenient parameters, using defaults", file=sys.stderr)
-                data_handler = GenericDataHandler(
-                    file_path=temp_file,
-                    data_format='csv',
-                    data_type='enmo-mg',
-                    time_format='datetime',
-                    time_column='timestamp',
-                    data_columns=['enmo'],
-                    verbose=False
-                )
+                print(f"[DEBUG] GenericDataHandler doesn't support lenient parameters, using defaults: {e}", file=sys.stderr)
+                try:
+                    data_handler = GenericDataHandler(
+                        file_path=temp_file,
+                        data_format='csv',
+                        data_type='enmo-mg',
+                        time_format='datetime',
+                        time_column='timestamp',
+                        data_columns=['enmo'],
+                        verbose=False
+                    )
+                    print(f"[DEBUG] GenericDataHandler created with default parameters", file=sys.stderr)
+                except Exception as init_error:
+                    result['message'] = f"Error initializing GenericDataHandler: {str(init_error)}"
+                    result['error'] = str(init_error)
+                    import traceback
+                    result['traceback'] = traceback.format_exc()
+                    raise
+            except Exception as e:
+                error_msg = str(e)
+                if "Could not convert string" in error_msg or "convert" in error_msg.lower():
+                    result['message'] = f"Data conversion error in GenericDataHandler: {error_msg}. This usually means the CSV file contains invalid numeric values or incorrect format."
+                    result['error'] = error_msg
+                    import traceback
+                    result['traceback'] = traceback.format_exc()
+                    # Try to provide more diagnostic information
+                    try:
+                        diagnostic_df = pd.read_csv(temp_file)
+                        result['diagnostic'] = {
+                            'columns': diagnostic_df.columns.tolist(),
+                            'dtypes': {str(k): str(v) for k, v in diagnostic_df.dtypes.to_dict().items()},
+                            'shape': diagnostic_df.shape,
+                            'sample_rows': diagnostic_df.head(10).to_dict('records') if len(diagnostic_df) > 0 else []
+                        }
+                    except:
+                        pass
+                else:
+                    result['message'] = f"Error initializing GenericDataHandler: {error_msg}"
+                    result['error'] = error_msg
+                    import traceback
+                    result['traceback'] = traceback.format_exc()
+                raise
             
             # Create a record for CosinorAge prediction - following reference implementation
             record = {
@@ -698,23 +803,64 @@ def get_visualization_data(csv_file_path, age=None, gender=None):
         temp_file_path = temp_file.name
         temp_file.close()
         
-        # Read and preprocess CSV
-        df = pd.read_csv(csv_file_path)
+        # Read and preprocess CSV with explicit error handling
+        try:
+            df = pd.read_csv(csv_file_path)
+        except Exception as e:
+            result['message'] = f"Error reading CSV file: {str(e)}"
+            result['error'] = str(e)
+            import traceback
+            result['traceback'] = traceback.format_exc()
+            return json.dumps(result)
+        
+        # Log column information for debugging
+        print(f"[DEBUG] CSV columns: {df.columns.tolist()}", file=sys.stderr)
+        print(f"[DEBUG] CSV dtypes: {df.dtypes.to_dict()}", file=sys.stderr)
+        print(f"[DEBUG] CSV shape: {df.shape}", file=sys.stderr)
         
         has_enmo_format = 'enmo' in df.columns and 'timestamp' in df.columns
         has_xyz_format = all(col in df.columns for col in ['x', 'y', 'z'])
         
         if has_xyz_format and not has_enmo_format:
-            # Calculate ENMO (Euclidean Norm Minus One)
-            # Note: Assumes accelerometer values are in m/s² (Android format)
-            # If values are already in g units, remove the /GRAVITY_MS2 conversion
-            GRAVITY_MS2 = 9.80665  # Standard gravity in m/s²
-            magnitude = np.sqrt(df['x']**2 + df['y']**2 + df['z']**2)
-            magnitude_g = magnitude / GRAVITY_MS2  # Convert m/s² to g units
-            df['enmo'] = (magnitude_g - 1.0).clip(lower=0)  # ENMO in g units
+            # Explicitly convert numeric columns to float, handling errors
+            try:
+                for col in ['x', 'y', 'z']:
+                    if col in df.columns:
+                        # Convert to numeric, coercing errors to NaN
+                        df[col] = pd.to_numeric(df[col], errors='coerce')
+                # Drop rows with invalid numeric values
+                df = df.dropna(subset=['x', 'y', 'z'])
+                
+                if len(df) == 0:
+                    result['message'] = "No valid numeric data found in x, y, z columns"
+                    return json.dumps(result)
+                
+                # Calculate ENMO (Euclidean Norm Minus One)
+                # Note: Assumes accelerometer values are in m/s² (Android format)
+                # If values are already in g units, remove the /GRAVITY_MS2 conversion
+                GRAVITY_MS2 = 9.80665  # Standard gravity in m/s²
+                magnitude = np.sqrt(df['x']**2 + df['y']**2 + df['z']**2)
+                magnitude_g = magnitude / GRAVITY_MS2  # Convert m/s² to g units
+                df['enmo'] = (magnitude_g - 1.0).clip(lower=0)  # ENMO in g units
+            except Exception as e:
+                result['message'] = f"Error converting x, y, z columns to numeric: {str(e)}"
+                result['error'] = str(e)
+                import traceback
+                result['traceback'] = traceback.format_exc()
+                return json.dumps(result)
         
         if 'enmo' not in df.columns or 'timestamp' not in df.columns:
             result['message'] = f"Unsupported CSV format. Expected 'timestamp,enmo' or 'timestamp,x,y,z'"
+            return json.dumps(result)
+        
+        # Convert ENMO to numeric if it's not already
+        try:
+            df['enmo'] = pd.to_numeric(df['enmo'], errors='coerce')
+        except Exception as e:
+            result['message'] = f"Error converting ENMO column to numeric: {str(e)}"
+            result['error'] = str(e)
+            import traceback
+            result['traceback'] = traceback.format_exc()
             return json.dumps(result)
         
         df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
